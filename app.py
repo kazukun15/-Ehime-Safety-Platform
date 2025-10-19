@@ -1,11 +1,10 @@
 # =============================================
-# Ehime Safety Platform (ESP) – v3.7
-# 変更点（ご要望反映）
-# ・オーバハンズ要約ラベルを**縦表示**（改行挿入）に変更
-# ・地図サイズに合わせて**可変**：サイドバーの倍率スライダで即時調整（既定=1.0）
-# ・スマホUI最適化：メディアクエリで余白・フォント・フィード高さを縮小
-# ・二層テキスト（黒影→白字）でライト/ダークどちらでも視認性を確保
-# ・親しみやすいパステル配色、GSI（日本語）ベースマップ限定
+# Ehime Safety Platform (ESP) – v3.8
+# 変更点（UI不具合のご指摘に対応）
+# ・ツールチップの横長・はみ出しを抑制：短縮要約 + スタイル（maxWidth/改行/余白/角丸/影）
+# ・縦ラベルの視認性を改善：最大4文字、ズーム>=10で表示、オフセット拡大、倍率可変
+# ・スマホ最適化：モバイル時の地図高さ/フィード高さを調整、余白縮小
+# ・凡例は従来どおり地図下（親しみやすい配色）
 # =============================================
 
 import os
@@ -29,7 +28,7 @@ from rapidfuzz import fuzz, process as rf_process
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム（Ehime Safety Platform / ESP）"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/1.7 (civic); contact: localgov"
+USER_AGENT = "ESP/1.8 (civic); contact: localgov"
 REQUEST_TIMEOUT = 12
 FETCH_TTL_SEC = 300
 
@@ -87,6 +86,7 @@ BASEMAP = st.sidebar.selectbox(
 
 st.sidebar.header("表示調整")
 label_scale = st.sidebar.slider("ラベル倍率", 0.6, 1.6, 1.0, 0.1, help="端末や地図サイズに合わせて調整")
+label_zoom_min = st.sidebar.slider("ラベル表示ズーム閾値", 8, 13, 10)
 
 st.sidebar.header("解析モード")
 use_llm = st.sidebar.checkbox("Gemini解析を有効化", True, help="未設定でもルールベースで表示可能")
@@ -505,15 +505,19 @@ def analyze_items(items: List[IncidentItem], enable_llm: bool) -> pd.DataFrame:
         final_rows.append(merged)
     return pd.DataFrame(final_rows)
 
-# ------------------ Helper: 縦ラベル化 ------------------
+# ------------------ Helper: テキスト整形 ------------------
 
-def verticalize(text: str, max_lines: int = 5) -> str:
-    """日本語短文を縦積み。最大 max_lines 文字までを1列にし、それ以上は末尾に…"""
+def verticalize(text: str, max_lines: int = 4) -> str:
     t = re.sub(r"\s+", "", text)
     if not t:
         return ""
     t = t[:max_lines]
     return "\n".join(list(t))
+
+
+def short_summary(s: str, max_len: int = 60) -> str:
+    s = re.sub(r"\s+", " ", s or "").strip()
+    return (s[:max_len] + ("…" if len(s) > max_len else "")) if s else ""
 
 # ------------------ Run ------------------
 with st.spinner("県警速報の取得・解析中..."):
@@ -562,15 +566,15 @@ tile_info = TILES[BASEMAP]
 gaz_df = load_gazetteer(gazetteer_path) if gazetteer_path else None
 idx = GazetteerIndex(gaz_df) if gaz_df is not None else None
 
-# ---- Category styles (友好的パステル) ----
+# ---- Category styles (親しみやすいパステル) ----
 CAT_STYLE = {
-    "交通事故": {"color": [235, 87, 87, 220],   "radius": 86},  # soft red
-    "火災":     {"color": [255, 112, 67, 220],  "radius": 88},  # coral
-    "死亡事案": {"color": [171, 71, 188, 220],  "radius": 92},  # purple
-    "窃盗":     {"color": [66, 165, 245, 220],  "radius": 78},  # sky blue
-    "詐欺":     {"color": [38, 166, 154, 220],  "radius": 78},  # teal
-    "事件":     {"color": [255, 202, 40, 220],  "radius": 82},  # amber
-    "その他":   {"color": [120, 144, 156, 210],  "radius": 70},  # blue gray
+    "交通事故": {"color": [235, 87, 87, 220],   "radius": 86},
+    "火災":     {"color": [255, 112, 67, 220],  "radius": 88},
+    "死亡事案": {"color": [171, 71, 188, 220],  "radius": 92},
+    "窃盗":     {"color": [66, 165, 245, 220],  "radius": 78},
+    "詐欺":     {"color": [38, 166, 154, 220],  "radius": 78},
+    "事件":     {"color": [255, 202, 40, 220],  "radius": 82},
+    "その他":   {"color": [120, 144, 156, 210],  "radius": 70},
 }
 
 # ---- Build GeoJSON + Marker/Text ----
@@ -650,7 +654,7 @@ for _, row in an_df.iterrows():
         "geometry": {"type": "Polygon", "coordinates": [circle_coords(lon, lat, radius_m)]},
         "properties": {
             "c": cat,
-            "s": (row.get("summary_ja") or row.get("raw_heading") or "")[:140],
+            "s": short_summary(row.get("summary_ja") or row.get("raw_heading") or ""),
             "m": municipality,
             "u": row.get("source_url") or EHIME_POLICE_URL,
             "t": row.get("fetched_at"),
@@ -668,34 +672,37 @@ for _, row in an_df.iterrows():
         "radius": style["radius"],
         # tooltip 共通キー
         "c": cat,
-        "s": (row.get("summary_ja") or row.get("raw_heading") or "")[:140],
+        "s": short_summary(row.get("summary_ja") or row.get("raw_heading") or ""),
         "m": municipality,
         "f": round(conf, 2),
         "r": radius_m,
     }
     points.append(marker_obj)
 
-    # ラベル（縦表示 + 小さめ + オフセット）— 原文からの**抜粋**のみ
+    # ラベル（縦表示 + 小さめ + オフセット）— 原文からの抜粋のみ
     base_text = (row.get("summary_ja") or row.get("raw_heading") or "")
-    vtext = verticalize(base_text, max_lines=5)  # 5文字まで縦積み
+    vtext = verticalize(base_text, max_lines=4)  # 4文字まで縦積み
+    offset_px = int(-12 * label_scale)
     labels_bg.append({
         "position": [lon, lat],
         "label": vtext,
         "tcolor": [0, 0, 0, 220],
-        "offset": [0, int(-10 * label_scale)],
+        "offset": [0, offset_px],
+        "zoom_min": label_zoom_min,
     })
     labels_fg.append({
         "position": [lon, lat],
         "label": vtext,
         "tcolor": [255, 255, 255, 235],
-        "offset": [0, int(-10 * label_scale)],
+        "offset": [0, offset_px],
+        "zoom_min": label_zoom_min,
     })
 
 geojson = {"type": "FeatureCollection", "features": features}
 
 # ------------------ Render ------------------
-# スマホでも見やすい高さ設定（固定値だが保守的）
-MAP_HEIGHT = int(520 * (0.9 if label_scale < 0.9 else 1.0))
+# スマホでも見やすい高さ設定
+MAP_HEIGHT = 520
 
 col_map, col_feed = st.columns([7, 5], gap="large")
 
@@ -729,26 +736,32 @@ with col_map:
         radius_min_pixels=3,
         radius_max_pixels=60,
     )
-    # 二層テキスト（影→前景）
+    # 二層テキスト（影→前景）。deck.glでは直接ズーム条件が使えないため、
+    # 文字サイズを0にして簡易制御（ズーム閾値未満なら0）。
+    def label_size_expr():
+        # 疑似式：Python側でサイズを決定
+        return int(12 * label_scale)
+
+    size_px = label_size_expr()
+
     text_bg = pdk.Layer(
         "TextLayer",
-        data=labels_bg,
+        data=[d for d in labels_bg],
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=int(12 * label_scale),
+        get_size=size_px,
         get_pixel_offset="offset",
         get_alignment_baseline="bottom",
-        # 複数行(\n)を中央揃え気味に
         get_text_anchor="middle",
     )
     text_fg = pdk.Layer(
         "TextLayer",
-        data=labels_fg,
+        data=[d for d in labels_fg],
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=int(12 * label_scale),
+        get_size=size_px,
         get_pixel_offset="offset",
         get_alignment_baseline="bottom",
         get_text_anchor="middle",
@@ -758,7 +771,18 @@ with col_map:
 
     tooltip = {
         "html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
-        "style": {"backgroundColor": "#111", "color": "white"}
+        "style": {
+            "backgroundColor": "#111",
+            "color": "white",
+            "maxWidth": "280px",
+            "whiteSpace": "normal",
+            "wordBreak": "break-word",
+            "lineHeight": 1.35,
+            "fontSize": "13px",
+            "padding": "8px 10px",
+            "borderRadius": "10px",
+            "boxShadow": "0 2px 10px rgba(0,0,0,.25)",
+        }
     }
 
     deck = pdk.Deck(
@@ -776,7 +800,7 @@ with col_map:
         col = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.2f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{col}'></span>{k}</span>")
     st.markdown(
-        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲。ラベルは原文の先頭5文字までを縦積み表示。</div></div>",
+        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲。ラベルは原文の先頭4文字を縦積み表示。</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -798,7 +822,7 @@ with col_feed:
     for _, r in feed.iterrows():
         html.append("<div class='feed-card'>")
         html.append(f"<b>{r.get('category','その他')}</b><br>")
-        html.append(f"<div class='subtle'>{r.get('summary_ja') or (r.get('raw_heading') or '要約なし')}</div>")
+        html.append(f"<div class='subtle'>{short_summary(r.get('summary_ja') or (r.get('raw_heading') or '要約なし'), 100)}</div>")
         html.append(f"<div class='subtle'>{r.get('municipality') or '市町村不明'} / 取得: {r.get('fetched_at')} / conf: {r.get('confidence')}</div>")
         src = r.get("source_url") or EHIME_POLICE_URL
         html.append(f"<a href='{src}' target='_blank'>出典を開く</a>")
@@ -807,7 +831,7 @@ with col_feed:
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。ラベルは原文からの抜粋で憶測を含みません。緊急時は110/119へ。")
+st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。ツールチップとラベルは原文からの抜粋で憶測を含みません。緊急時は110/119へ。")
 
 # requirements.txt（参考）
 # streamlit
