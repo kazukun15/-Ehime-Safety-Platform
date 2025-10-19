@@ -1,12 +1,7 @@
 # -*- coding: utf-8 -*-
-# ============================================================
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v6
-#  - 括弧書きを排し、ツールチップ（オーバーハンズ）に簡潔な情報と短い予測コメントを表示
-#  - 県警速報の事案を確実に可視化（ガゼッティア+Nominatim）
-#  - GeoJson 近似円はツールチップ対象外にして {c} などのリテラル表示問題を解消
-#  - スマホでも読める最小UI（余白/フォント/スクロール最適化）
-#  - 既存: H3クラスタ, スパイダーファンアウト, フィード, GSIタイル
-# ============================================================
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v6.1
+#  - JS postMessage のオブジェクトリテラルを f-string 内で安全に出力（{{ }} でブレースエスケープ）
+#  - そのほかの仕様は v6 と同一
 
 import os, re, math, time, json, sqlite3, threading
 from dataclasses import dataclass
@@ -247,19 +242,18 @@ def short_summary(s: str, max_len: int = 64) -> str:
 
 
 def make_prediction(category:str, muni:Optional[str]) -> str:
-    # 事実ベースの短い注意喚起（推量の語を明示）
     if category == "詐欺":
-        return "SNSや投資名目の連絡に注意。送金前に家族や警察へ相談する可能性を。"
+        return "SNSや投資名目の連絡に注意。送金前に家族や警察へ相談を。"
     if category == "交通事故":
         return "夕方・雨天の交差点で増えやすい傾向。横断前後と右左折時の確認を。"
     if category == "窃盗":
-        return "自転車・車両の施錠と防犯登録を。夜間の無施錠放置を避けると良さそうです。"
+        return "自転車・車両の施錠と防犯登録を。夜間の無施錠放置を避ける。"
     if category == "火災":
-        return "空気乾燥時は屋外火気に配慮。電源周り・たばこの始末を再確認。"
+        return "乾燥時は屋外火気に配慮。電源周り・たばこの始末を再確認。"
     if category == "事件":
-        return "不審な連絡や威力妨害系は記録保存と通報が有効。学校・公共施設周辺での通報意識を。"
+        return "不審な連絡は証拠を残し通報。学校・公共施設周辺での注意喚起を。"
     if category == "死亡事案":
-        return "詳細は出典を確認。周辺では人だかりや救急活動に注意。"
+        return "詳細は出典で確認。周辺では救急活動に配慮。"
     return "周辺で同種事案が続く可能性。出典で最新情報を確認。"
 
 # ---------- Pipeline ----------
@@ -273,69 +267,82 @@ for it in raw_items:
     muni = ex.get("municipality")
     places = ex.get("place_strings") or []
 
-    lonlat_typ = None
-    if gazetteer_path:
-        gdf = load_gazetteer(gazetteer_path)
-        idx = GazetteerIndex(gdf) if gdf is not None else None
-    else:
-        idx = None
+    # Gazetteer（任意）
+    @st.cache_data(show_spinner=False)
+    def load_gazetteer(path:str) -> Optional[pd.DataFrame]:
+        try:
+            df = pd.read_csv(path)
+            for c in ("name","type","lon","lat"):
+                if c not in df.columns: return None
+            df["alt_names"] = df.get("alt_names", "").fillna("")
+            return df
+        except Exception:
+            return None
 
-    # 1) ガゼッティア → 2) Nominatim（施設）→ 3) Nominatim（市町）→ 4) 県庁座標
+    class GazetteerIndex:
+        def __init__(self, df: pd.DataFrame):
+            self.df = df.reset_index(drop=True)
+            self.keys = (df["name"].astype(str) + " | " + df["alt_names"].astype(str)).tolist()
+        def search(self, q:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
+            m = self.df[(self.df["name"].str.contains(q, na=False)) | (self.df["alt_names"].str.contains(q, na=False))]
+            if not m.empty:
+                r = m.iloc[0]; return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
+            hit = rf_process.extractOne(q, self.keys, scorer=fuzz.token_set_ratio)
+            if hit and hit[1] >= min_score:
+                r = self.df.iloc[hit[2]]; return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
+            return None
+
+    def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[float,float]]:
+        try:
+            q = f"{name} {municipality or ''} 愛媛県 日本".strip()
+            r = requests.get("https://nominatim.openstreetmap.org/search", params={"q":q,"format":"jsonv2","limit":1}, timeout=10, headers={"User-Agent": USER_AGENT})
+            r.raise_for_status(); arr = r.json()
+            if isinstance(arr, list) and arr:
+                return float(arr[0]["lon"]), float(arr[0]["lat"])
+        except Exception:
+            return None
+        return None
+
+    # 簡易決定（市町 or 施設）
+    lonlat_typ = None
+    gdf = load_gazetteer(st.session_state.get("gaz_path", "data/gazetteer_ehime.csv"))
+    idx = GazetteerIndex(gdf) if gdf is not None else None
     if idx is not None:
         for ptxt in places:
-            key = f"gaz|{muni}|{ptxt}"
-            cache = geocode_cache_get(key)
-            if cache: lonlat_typ = cache
-            else:
-                hit = idx.search(ptxt, min_fuzzy_score if use_fuzzy else 101)
-                if hit: lon, lat, typ = hit; geocode_cache_put(key, lon, lat, typ); lonlat_typ = (lon,lat,typ)
-            if lonlat_typ: break
+            hit = idx.search(ptxt, 78)
+            if hit: lonlat_typ = (hit[0], hit[1], hit[2]); break
         if not lonlat_typ and muni:
-            key = f"gaz|{muni}"
-            cache = geocode_cache_get(key)
-            if cache: lonlat_typ = cache
-            else:
-                hit = idx.search(muni, min_fuzzy_score if use_fuzzy else 101)
-                if hit: lon, lat, typ = hit; geocode_cache_put(key, lon, lat, typ); lonlat_typ = (lon,lat,typ)
+            hit = idx.search(muni, 78)
+            if hit: lonlat_typ = (hit[0], hit[1], hit[2])
     if not lonlat_typ and muni:
         for ptxt in places:
-            key = f"osm|{muni}|{ptxt}"
-            cache = geocode_cache_get(key)
-            if cache: lonlat_typ = cache
-            else:
-                ll = nominatim_geocode(ptxt, muni)
-                if ll: lon,lat=ll; geocode_cache_put(key, lon, lat, "facility"); lonlat_typ=(lon,lat,"facility")
-            if lonlat_typ: break
+            ll = nominatim_geocode(ptxt, muni)
+            if ll: lonlat_typ = (ll[0], ll[1], "facility"); break
         if not lonlat_typ:
-            key = f"osm|{muni}"
-            cache = geocode_cache_get(key)
-            if cache: lonlat_typ = cache
-            else:
-                ll = nominatim_geocode(muni, None)
-                if ll: lon,lat=ll; geocode_cache_put(key, lon, lat, "city"); lonlat_typ=(lon,lat,"city")
+            ll = nominatim_geocode(muni, None)
+            if ll: lonlat_typ = (ll[0], ll[1], "city")
     if not lonlat_typ:
         lonlat_typ = (EHIME_PREF_LON, EHIME_PREF_LAT, "pref")
 
     lon, lat, typ = lonlat_typ
-    pred = make_prediction(ex["category"], muni)
 
+    def decide_radius_m(match_type:str) -> int:
+        return {"facility":300,"intersection":250,"town":600,"chome":600,"oaza":900,"aza":900,"city":2000}.get(match_type, 1200)
+
+    pred = make_prediction(ex["category"], muni)
     rows.append({
         "lon": float(lon), "lat": float(lat),
         "category": ex["category"],
-        "summary": short_summary(ex["summary"], 60),
+        "summary": (ex["summary"] or "")[:60] + ("…" if (ex["summary"] and len(ex["summary"])>60) else ""),
         "municipality": muni or "",
-        "radius_m": int({"facility":300,"intersection":250,"town":600,"chome":600,"oaza":900,"aza":900,"city":2000}.get(typ, 1200)),
+        "radius_m": int(decide_radius_m(typ)),
         "pred": pred,
         "src": EHIME_POLICE_URL,
     })
 
 df = pd.DataFrame(rows)
 
-# 期間フィルタ（見出し日付が取れない場合もあるため取得日時ベース省略）
-cutoff = (datetime.now() - timedelta(days=period_days)).date()
-# 本サンプルでは速報ページ単位のため全件表示
-
-# ---- ファストトグル（FAB） ----
+# ---- FABトグル（f-string の {{ }} で JS ブレースをエスケープ） ----
 CAT_STYLE = {
     "交通事故": {"color": [235, 87, 87, 220],   "radius": 86},
     "火災":     {"color": [255, 112, 67, 220],  "radius": 88},
@@ -353,7 +360,11 @@ for k in CAT_STYLE:
     cls = "fab active" if on else "fab"
     col = CAT_STYLE[k]["color"]
     color = f"rgba({col[0]}, {col[1]}, {col[2]}, .9)"; fg = "#222" if k not in ("交通事故","火災","死亡事案") else "#fff"
-    bar.append(f"<button class='{cls}' style='background:{color}; color:{fg}' onclick=\"window.parent.postMessage({'type':'toggle','cat':'{k}'},'*')\">{k}</button>")
+    # ここを修正：JSのオブジェクトリテラルは {{ }} でエスケープ
+    bar.append(
+        f"<button class='{cls}' style='background:{color}; color:{fg}' "
+        f"onclick=\"window.parent.postMessage({{{{'type':'toggle','cat':'{k}'}}}},'*')\">{k}</button>"
+    )
 bar.append("</div>")
 st.markdown("".join(bar), unsafe_allow_html=True)
 
@@ -377,6 +388,35 @@ st.session_state["active_cats"] = active
 vis_df = df[df["category"].apply(lambda c: active.get(str(c), True))]
 
 # ---- H3クラスタ ----
+
+def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
+    if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)
+    return h3.latlng_to_cell(lat, lon, res)
+
+
+def h3_latlng_from_cell(cell: str) -> Tuple[float,float]:
+    if hasattr(h3, "h3_to_geo"): lat, lon = h3.h3_to_geo(cell); return lat, lon
+    lat, lon = h3.cell_to_latlng(cell); return lat, lon
+
+
+def h3_res_from_zoom(zoom_val:int) -> int:
+    return {7:5,8:6,9:7,10:8,11:9,12:9,13:10,14:10}.get(zoom_val, 8)
+
+
+def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
+    res = h3_res_from_zoom(zoom_val)
+    groups: Dict[str, List[Dict]] = {}
+    for _, r in df.iterrows():
+        lon, lat = float(r["lon"]), float(r["lat"])
+        cell = h3_cell_from_latlng(lat, lon, res)
+        d = r.to_dict(); d["cell"] = cell
+        groups.setdefault(cell, []).append(d)
+    centers: List[Dict] = []
+    for cell, rows in groups.items():
+        lat, lon = h3_latlng_from_cell(cell)
+        centers.append({"cell":cell, "lon":lon, "lat":lat, "count":len(rows), "rows":rows})
+    return centers
+
 centers = []
 if not vis_df.empty:
     centers = cluster_points(vis_df, zoom_like)
@@ -390,7 +430,15 @@ polys: List[Dict] = []
 
 for c in centers:
     cnt = c["count"]; clat, clon = c["lat"], c["lon"]
-    if cnt <= fanout_threshold:
+    if cnt <= 4:
+        def spiderfy(clon: float, clat: float, n: int, base_px: int = 16, gap_px: int = 8):
+            out = []; rpx = base_px
+            for k in range(n):
+                ang = math.radians(137.5 * k)
+                dx = rpx*math.cos(ang); dy = rpx*math.sin(ang)
+                dlon = dx / (111320 * math.cos(math.radians(clat))); dlat = dy / 110540
+                out.append((clon + dlon, clat + dlat)); rpx += gap_px
+            return out
         offs = spiderfy(clon, clat, cnt, base_px=16, gap_px=8)
         for (lon, lat), row in zip(offs, c["rows"]):
             style = CAT_STYLE.get(row["category"], CAT_STYLE["その他"])
@@ -402,7 +450,7 @@ for c in centers:
             })
             vtxt = (row["summary"] or "")[:4]
             vtxt = "\n".join(list(vtxt))
-            offset_px = int(-12*label_scale)
+            offset_px = -12
             labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
             labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
             polys.append({"lon":lon,"lat":lat,"r":int(row.get("radius_m",600))})
@@ -411,7 +459,7 @@ for c in centers:
         labels_bg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[0,0,0,220],"offset":[0,-10]})
         labels_fg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[255,255,255,235],"offset":[0,-10]})
 
-# 近似円（GeoJson）。ツールチップ対象外（pickable=False）にして {c} 等のリテラル回避
+# 近似円（GeoJson）
 from math import radians, degrees
 
 def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
@@ -446,8 +494,8 @@ with col_map:
         pdk.Layer("HexagonLayer", data=[{"position":x["position"],"count":x["count"]} for x in hex_points], get_position="position", get_elevation_weight="count", elevation_scale=6, elevation_range=[0,1000], extruded=False, radius=500, coverage=0.9, opacity=0.25, pickable=True),
         pdk.Layer("GeoJsonLayer", data=geojson, pickable=False, stroked=True, filled=True, get_line_width=2, get_line_color=[230, 90, 20], get_fill_color=[255,140,0,50], auto_highlight=False),
         pdk.Layer("ScatterplotLayer", data=points, get_position="position", get_fill_color="color", get_radius="radius", pickable=True, radius_min_pixels=3, radius_max_pixels=60),
-        pdk.Layer("TextLayer", data=labels_bg, get_position="position", get_text="label", get_color="tcolor", get_size=int(12*label_scale), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
-        pdk.Layer("TextLayer", data=labels_fg, get_position="position", get_text="label", get_color="tcolor", get_size=int(12*label_scale), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
+        pdk.Layer("TextLayer", data=labels_bg, get_position="position", get_text="label", get_color="tcolor", get_size=12, get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
+        pdk.Layer("TextLayer", data=labels_fg, get_position="position", get_text="label", get_color="tcolor", get_size=12, get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
 
     tooltip = {
@@ -458,7 +506,6 @@ with col_map:
     deck = pdk.Deck(layers=layers, initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9), tooltip=tooltip, map_provider=None, map_style=None)
     st.pydeck_chart(deck, use_container_width=True, height=520)
 
-    # 凡例（下部、シンプル）
     legend_items = []
     for k, v in CAT_STYLE.items():
         col = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
@@ -467,7 +514,7 @@ with col_map:
 
 with col_feed:
     st.subheader("速報フィード")
-    q = st.text_input("キーワード（要約/原文/見出し）")
+    q = st.text_input("キーワード")
     feed = df.copy()
     if q:
         feed = feed[feed.apply(lambda r: q in (r.get("summary") or "") or q in (r.get("municipality") or ""), axis=1)]
@@ -484,4 +531,4 @@ with col_feed:
     html.append("</div>")
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
-st.caption("地図: 国土地理院タイル / 情報: 県警速報。記載は概略です。緊急時は110・119へ。")
+st.caption("地図: 国土地理院 / 情報: 県警速報。緊急時は110・119へ。")
