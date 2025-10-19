@@ -1,10 +1,11 @@
 # =============================================
-# Ehime Safety Platform (ESP) – v3.6
+# Ehime Safety Platform (ESP) – v3.7
 # 変更点（ご要望反映）
-# ・オーバハンズ（マップ上ラベル）を小さめ（12px）にし、ピクセルオフセットを-8pxへ
-# ・二層テキスト（シャドウ＋前景）でダーク/ライト双方で視認性を確保
-# ・全体配色を親しみやすいパステル寄りに調整（カテゴリ別マーカー）
-# ・凡例はそのまま下部、ツールチップは共通キーで安定
+# ・オーバハンズ要約ラベルを**縦表示**（改行挿入）に変更
+# ・地図サイズに合わせて**可変**：サイドバーの倍率スライダで即時調整（既定=1.0）
+# ・スマホUI最適化：メディアクエリで余白・フォント・フィード高さを縮小
+# ・二層テキスト（黒影→白字）でライト/ダークどちらでも視認性を確保
+# ・親しみやすいパステル配色、GSI（日本語）ベースマップ限定
 # =============================================
 
 import os
@@ -28,7 +29,7 @@ from rapidfuzz import fuzz, process as rf_process
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム（Ehime Safety Platform / ESP）"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/1.6 (civic); contact: localgov"
+USER_AGENT = "ESP/1.7 (civic); contact: localgov"
 REQUEST_TIMEOUT = 12
 FETCH_TTL_SEC = 300
 
@@ -45,7 +46,7 @@ st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 st.markdown(
     """
     <style>
-      .big-title {font-size:1.6rem; font-weight:700;}
+      .big-title {font-size:1.5rem; font-weight:700;}
       .subtle {color:#5f6368}
       .legend {font-size:0.95rem; background:#fafafa; border:1px solid #eee; border-radius:12px; padding:10px 12px;}
       .legend .item {display:inline-flex; align-items:center; margin-right:14px; margin-bottom:6px}
@@ -53,6 +54,12 @@ st.markdown(
       .feed-card {background:#ffffff; padding:12px 14px; border-radius:14px; border:1px solid #e8e8e8; margin-bottom:10px; box-shadow:0 1px 2px rgba(0,0,0,.04)}
       .feed-scroll {max-height:700px; overflow-y:auto; padding-right:6px}
       .stButton>button {border-radius:999px;}
+      /* ---- Mobile tweaks ---- */
+      @media (max-width: 640px){
+        .big-title{font-size:1.2rem}
+        .feed-scroll{max-height:50vh}
+        .legend{font-size:.9rem}
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -77,6 +84,9 @@ BASEMAP = st.sidebar.selectbox(
     ),
     label_visibility="collapsed",
 )
+
+st.sidebar.header("表示調整")
+label_scale = st.sidebar.slider("ラベル倍率", 0.6, 1.6, 1.0, 0.1, help="端末や地図サイズに合わせて調整")
 
 st.sidebar.header("解析モード")
 use_llm = st.sidebar.checkbox("Gemini解析を有効化", True, help="未設定でもルールベースで表示可能")
@@ -495,6 +505,16 @@ def analyze_items(items: List[IncidentItem], enable_llm: bool) -> pd.DataFrame:
         final_rows.append(merged)
     return pd.DataFrame(final_rows)
 
+# ------------------ Helper: 縦ラベル化 ------------------
+
+def verticalize(text: str, max_lines: int = 5) -> str:
+    """日本語短文を縦積み。最大 max_lines 文字までを1列にし、それ以上は末尾に…"""
+    t = re.sub(r"\s+", "", text)
+    if not t:
+        return ""
+    t = t[:max_lines]
+    return "\n".join(list(t))
+
 # ------------------ Run ------------------
 with st.spinner("県警速報の取得・解析中..."):
     items = load_police_items()
@@ -655,25 +675,28 @@ for _, row in an_df.iterrows():
     }
     points.append(marker_obj)
 
-    # ラベル（小さめ＆二層）— 憶測せず原文由来を短縮
+    # ラベル（縦表示 + 小さめ + オフセット）— 原文からの**抜粋**のみ
     base_text = (row.get("summary_ja") or row.get("raw_heading") or "")
-    label_text = re.sub(r"\s+", " ", base_text)[:10]  # 10文字程度
+    vtext = verticalize(base_text, max_lines=5)  # 5文字まで縦積み
     labels_bg.append({
         "position": [lon, lat],
-        "label": label_text,
+        "label": vtext,
         "tcolor": [0, 0, 0, 220],
-        "offset": [0, -8],
+        "offset": [0, int(-10 * label_scale)],
     })
     labels_fg.append({
         "position": [lon, lat],
-        "label": label_text,
+        "label": vtext,
         "tcolor": [255, 255, 255, 235],
-        "offset": [0, -8],
+        "offset": [0, int(-10 * label_scale)],
     })
 
 geojson = {"type": "FeatureCollection", "features": features}
 
 # ------------------ Render ------------------
+# スマホでも見やすい高さ設定（固定値だが保守的）
+MAP_HEIGHT = int(520 * (0.9 if label_scale < 0.9 else 1.0))
+
 col_map, col_feed = st.columns([7, 5], gap="large")
 
 with col_map:
@@ -713,9 +736,11 @@ with col_map:
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=12,
+        get_size=int(12 * label_scale),
         get_pixel_offset="offset",
         get_alignment_baseline="bottom",
+        # 複数行(\n)を中央揃え気味に
+        get_text_anchor="middle",
     )
     text_fg = pdk.Layer(
         "TextLayer",
@@ -723,9 +748,10 @@ with col_map:
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=12,
+        get_size=int(12 * label_scale),
         get_pixel_offset="offset",
         get_alignment_baseline="bottom",
+        get_text_anchor="middle",
     )
 
     layers = [tile_layer, circle_layer, marker_layer, text_bg, text_fg]
@@ -737,12 +763,12 @@ with col_map:
 
     deck = pdk.Deck(
         layers=layers,
-        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=132.7650, zoom=9),
+        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9),
         tooltip=tooltip,
         map_provider=None,
         map_style=None,
     )
-    st.pydeck_chart(deck, use_container_width=True)
+    st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
 
     # ---- 凡例（親しみやすい配色） ----
     legend_items = []
@@ -750,7 +776,7 @@ with col_map:
         col = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.2f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{col}'></span>{k}</span>")
     st.markdown(
-        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲。小さめの白文字ラベルに黒影を重ねて視認性を確保しています。</div></div>",
+        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲。ラベルは原文の先頭5文字までを縦積み表示。</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -781,7 +807,7 @@ with col_feed:
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。マップ上ラベルは原文からの抜粋で憶測を含みません。緊急時は110/119へ。")
+st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。ラベルは原文からの抜粋で憶測を含みません。緊急時は110/119へ。")
 
 # requirements.txt（参考）
 # streamlit
