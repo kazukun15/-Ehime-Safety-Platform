@@ -1,7 +1,9 @@
 # =============================================
-# Ehime Safety Platform (ESP) – v3 (robust empty-columns fix)
-# Streamlit app with defensive guards when DataFrame columns are missing
-# (fixes KeyError: 'occurred_date')
+# Ehime Safety Platform (ESP) – v3.2
+# ベースマップを「国土地理院（複数スタイル）」または「Google Maps(実験的)」に切替
+# - deck.gl TileLayer を使って GSI タイルを表示
+# - Google Maps は埋め込み(iframe)の実験オプション（APIキー必要、可用性に依存）
+# - 既存のインシデントGeoJsonLayerを重ね合わせ
 # =============================================
 
 import os
@@ -25,9 +27,9 @@ from rapidfuzz import fuzz, process as rf_process
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム（Ehime Safety Platform / ESP）"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/1.0 (civic); contact: localgov"
-REQUEST_TIMEOUT = 10
-FETCH_TTL_SEC = 300  # 5min
+USER_AGENT = "ESP/1.2 (civic); contact: localgov"
+REQUEST_TIMEOUT = 12
+FETCH_TTL_SEC = 300
 
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_MAX_TOKENS = 512
@@ -36,7 +38,7 @@ GEMINI_TEMPERATURE = 0.2
 EHIME_PREF_LAT = 33.8390
 EHIME_PREF_LON = 132.7650
 
-SLEEP_RANGE = (0.6, 1.2)
+SLEEP_RANGE = (0.6, 1.0)
 
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 st.markdown(
@@ -49,6 +51,8 @@ st.markdown(
       .legend {font-size:0.9rem;}
       .feed-card {background:#11111110; padding:12px 14px; border-radius:12px; border:1px solid #e0e0e0;}
       .stButton>button {border-radius:999px;}
+      .metric-box {background:#f7f7f7; border:1px solid #eee; border-radius:10px; padding:8px 10px;}
+      .note {font-size:0.85rem; color:#666}
     </style>
     """,
     unsafe_allow_html=True,
@@ -56,10 +60,28 @@ st.markdown(
 
 st.markdown(f"<div class='big-title'>🗺️ {APP_TITLE}</div>", unsafe_allow_html=True)
 
+# ------------------ Sidebar ------------------
 st.sidebar.header("表示項目")
 show_accidents = st.sidebar.checkbox("事故情報", True)
 show_crimes = st.sidebar.checkbox("犯罪情報", True)
 show_disasters = st.sidebar.checkbox("災害情報(警報等)", True)
+
+st.sidebar.header("ベースマップ")
+BASEMAP = st.sidebar.selectbox(
+    "地図タイル",
+    (
+        "GSI 標準 (標準地図)",
+        "GSI 淡色 (淡色地図)",
+        "GSI 航空写真 (オルソ)",
+        "GSI 陰影起伏 (標高表現)",
+        "Google Maps (実験・別枠)"
+    ),
+    help="原則は国土地理院タイル。GoogleはAPIキーが必要で別枠表示（オーバーレイ非対応）。"
+)
+GOOGLE_MAPS_API_KEY = st.sidebar.text_input("Google Maps API Key（任意）", type="password")
+
+st.sidebar.header("解析モード")
+use_llm = st.sidebar.checkbox("Gemini解析を有効化", True)
 
 st.sidebar.header("データ取得/設定")
 if st.sidebar.button("県警速報を再取得（キャッシュ無視）"):
@@ -73,6 +95,7 @@ min_fuzzy_score = st.sidebar.slider("最小スコア", 60, 95, 78)
 
 st.sidebar.caption("※参考情報。緊急時は110/119。現地の指示を優先。個人情報は表示しません。")
 
+# ------------------ Utils ------------------
 
 def jst_now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
@@ -81,8 +104,9 @@ def jst_now_iso() -> str:
 def content_fingerprint(text: str) -> str:
     return hashlib.blake2s(text.encode("utf-8")).hexdigest()
 
+# ------------------ SQLite Cache ------------------
 @st.cache_resource
-def get_sqlite() -> sqlite3.Connection:
+def get_sqlite():
     os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect("data/esp_cache.sqlite", check_same_thread=False)
     with conn:
@@ -113,6 +137,7 @@ def get_sqlite() -> sqlite3.Connection:
 conn = get_sqlite()
 conn_lock = threading.Lock()
 
+# ------------------ Cache helpers ------------------
 
 def cache_get_nlp(hid: str) -> Optional[Dict]:
     with conn_lock:
@@ -162,6 +187,7 @@ def fetch_meta_put(url: str, etag: Optional[str], last_modified: Optional[str], 
             (url, etag, last_modified, content_hash),
         )
 
+# ------------------ Fetch & Parse ------------------
 @dataclass
 class IncidentItem:
     id: str
@@ -171,6 +197,14 @@ class IncidentItem:
     incident_date: Optional[str]
     body: str
     fetched_at: str
+
+
+def http_get(url: str) -> str:
+    r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    enc = r.apparent_encoding or r.encoding or "utf-8"
+    r.encoding = enc
+    return r.text
 
 
 def http_get_conditional(url: str) -> Optional[str]:
@@ -184,6 +218,8 @@ def http_get_conditional(url: str) -> Optional[str]:
     if r.status_code == 304:
         return None
     r.raise_for_status()
+    enc = r.apparent_encoding or r.encoding or "utf-8"
+    r.encoding = enc
     txt = r.text
     fetch_meta_put(url, r.headers.get("ETag"), r.headers.get("Last-Modified"), content_fingerprint(txt))
     return txt
@@ -212,10 +248,9 @@ def parse_ehime_police_page(html: str) -> List[IncidentItem]:
 
     for b in blocks:
         heading = b.get("heading", "")
-        body = " ".join(b.get("body", []))[:1200]
+        body = " ".join(b.get("body", []))[:1600]
         m_date = re.search(r"（?(\d{1,2})月(\d{1,2})日", heading)
         m_station = re.search(r"（\d{1,2}月\d{1,2}日\s*([^\s）]+)）", heading)
-
         incident_date = None
         if m_date:
             m, d = int(m_date.group(1)), int(m_date.group(2))
@@ -223,9 +258,8 @@ def parse_ehime_police_page(html: str) -> List[IncidentItem]:
             cand = datetime(y, m, d).date()
             if cand > today: y -= 1
             incident_date = datetime(y, m, d).date().isoformat()
-
         station = m_station.group(1) if m_station else None
-        rid = content_fingerprint((heading + " " + body)[:600])
+        rid = content_fingerprint((heading + " " + body)[:800])
         out.append(IncidentItem(
             id=rid,
             source_url=EHIME_POLICE_URL,
@@ -237,20 +271,69 @@ def parse_ehime_police_page(html: str) -> List[IncidentItem]:
         ))
     return out
 
+# ------------------ Gemini / Rule-based ------------------
 @st.cache_resource
 def gemini_client():
     import google.generativeai as genai
     key = os.getenv("GEMINI_API_KEY")
     if not key:
-        st.error("GEMINI_API_KEY が未設定です。環境変数を設定してください。")
-        st.stop()
+        return None
     genai.configure(api_key=key)
     return genai.GenerativeModel(GEMINI_MODEL)
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+CITY_NAMES = [
+    "松山市","今治市","新居浜市","西条市","大洲市","伊予市","四国中央市","西予市","東温市",
+    "上島町","久万高原町","松前町","砥部町","内子町","伊方町","松野町","鬼北町","愛南町"
+]
+CATEGORY_PATTERNS = [
+    ("交通事故", r"交通.*事故|自転車|バス|二輪|乗用|衝突|交差点|国道|県道"),
+    ("火災", r"火災|出火|全焼|半焼"),
+    ("死亡事案", r"死亡|死亡事案"),
+    ("窃盗", r"窃盗|万引|盗"),
+    ("詐欺", r"詐欺|還付金|投資詐欺|特殊詐欺"),
+    ("事件", r"威力業務妨害|条例違反|暴行|傷害|脅迫|器物損壊"),
+]
+FACILITY_HINT = ["学校","小学校","中学校","高校","大学","グラウンド","体育館","公園","駅","港","病院","交差点"]
+
+
+def rule_based_extract(it: IncidentItem) -> Dict:
+    text = it.heading + " " + it.body
+    category = "その他"
+    for name, pat in CATEGORY_PATTERNS:
+        if re.search(pat, text):
+            category = name; break
+    muni = None
+    for c in CITY_NAMES:
+        if c in text:
+            muni = c; break
+    places = []
+    for hint in FACILITY_HINT:
+        m = re.findall(rf"([\w\u3040-\u30ff\u4e00-\u9fffA-Za-z0-9]+{hint})", text)
+        places.extend(m[:2])
+    s = re.sub(r"\s+", " ", it.body)[:140]
+    return {
+        "category": category,
+        "municipality": muni,
+        "place_strings": list(dict.fromkeys(places))[:3],
+        "road_refs": [],
+        "occurred_date": it.incident_date,
+        "occurred_time_text": None,
+        "summary_ja": s if s else it.heading.replace("■", "").strip(),
+        "confidence": 0.3,
+        "raw_heading": it.heading,
+        "raw_snippet": it.body[:200],
+        "source_url": it.source_url,
+        "fetched_at": it.fetched_at,
+        "id": it.id,
+    }
+
+
 def gemini_analyze_many(items: List[IncidentItem]) -> List[Dict]:
     model = gemini_client()
+    if model is None:
+        return []
     SYS = "事実のみを application/json で出力。欠測は null。要約は原文準拠で憶測禁止。"
 
     def one(it: IncidentItem) -> Dict:
@@ -262,36 +345,36 @@ def gemini_analyze_many(items: List[IncidentItem]) -> List[Dict]:
             f"summary_ja, confidence, raw_heading, raw_snippet\n"
             f"見出し:{it.heading}\n本文:{it.body}\n推定日:{it.incident_date} 署:{it.station}"
         )
-        gen_cfg = {
-            "temperature": GEMINI_TEMPERATURE,
-            "max_output_tokens": GEMINI_MAX_TOKENS,
-            "response_mime_type": "application/json",
-        }
+        gen_cfg = {"temperature": GEMINI_TEMPERATURE, "max_output_tokens": GEMINI_MAX_TOKENS, "response_mime_type": "application/json"}
         try:
             resp = model.generate_content([
                 {"role": "system", "parts": [SYS]},
                 {"role": "user", "parts": [user]},
             ], generation_config=gen_cfg)
-            txt = (resp.text or "").strip()
+            txt = (getattr(resp, "text", None) or "").strip()
             data = json.loads(txt) if txt else {}
         except Exception:
             data = {}
-        data.setdefault("category", "その他")
-        data.setdefault("municipality", None)
-        data.setdefault("place_strings", [])
-        data.setdefault("road_refs", [])
-        data.setdefault("occurred_date", it.incident_date)
-        data.setdefault("occurred_time_text", None)
-        data.setdefault("summary_ja", None)
-        data.setdefault("confidence", 0.4)
-        data.setdefault("raw_heading", it.heading)
-        data.setdefault("raw_snippet", it.body[:200])
-        data["source_url"] = it.source_url
-        data["fetched_at"] = it.fetched_at
-        data["id"] = it.id
-        cache_put_nlp(it.id, data)
+        base = rule_based_extract(it)
+        # 併合（LLM優先、欠損はルールで補完）
+        merged = {
+            "category": data.get("category") or base["category"],
+            "municipality": data.get("municipality") or base["municipality"],
+            "place_strings": data.get("place_strings") or base["place_strings"],
+            "road_refs": data.get("road_refs") or base["road_refs"],
+            "occurred_date": data.get("occurred_date") or base["occurred_date"],
+            "occurred_time_text": data.get("occurred_time_text") or base["occurred_time_text"],
+            "summary_ja": data.get("summary_ja") or base["summary_ja"],
+            "confidence": data.get("confidence", 0.6 if data else 0.3),
+            "raw_heading": it.heading,
+            "raw_snippet": it.body[:200],
+            "source_url": it.source_url,
+            "fetched_at": it.fetched_at,
+            "id": it.id,
+        }
+        cache_put_nlp(it.id, merged)
         time.sleep(SLEEP_RANGE[0])
-        return data
+        return merged
 
     out: List[Dict] = []
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -300,6 +383,7 @@ def gemini_analyze_many(items: List[IncidentItem]) -> List[Dict]:
             out.append(f.result())
     return out
 
+# ------------------ Gazetteer / Geocoding ------------------
 @st.cache_data(show_spinner=False)
 def load_gazetteer(csv_path: str) -> Optional[pd.DataFrame]:
     try:
@@ -329,10 +413,7 @@ class GazetteerIndex:
             return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
         return None
 
-FACILITY_KEYWORDS = [
-    "学校", "小学校", "中学校", "高校", "大学", "グラウンド", "体育館", "公園", "港", "病院",
-    "交差点", "インター", "IC", "PA", "駅", "温泉"
-]
+FACILITY_KEYWORDS = FACILITY_HINT
 
 def decide_radius_m(match_type: str) -> int:
     if match_type == "facility":
@@ -345,7 +426,7 @@ def decide_radius_m(match_type: str) -> int:
         return 900
     if match_type in ("city", "municipality"):
         return 2000
-    return 800
+    return 1200
 
 
 def classify_place(text: str) -> str:
@@ -365,7 +446,7 @@ def nominatim_geocode(name: str, municipality: Optional[str]) -> Optional[Tuple[
         q = f"{name} {municipality or ''} 愛媛県 日本".strip()
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": q, "format": "jsonv2", "limit": 1}
-        r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
+        r = requests.get(url, params=params, timeout=10, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
         arr = r.json()
         if isinstance(arr, list) and arr:
@@ -378,13 +459,17 @@ def nominatim_geocode(name: str, municipality: Optional[str]) -> Optional[Tuple[
 
 
 def geocode_with_cache(idx: Optional[GazetteerIndex], key: str, resolver) -> Optional[Tuple[float, float, str]]:
-    cached = cache_get_geo(key)
-    if cached:
-        return cached
+    with conn_lock:
+        cur = conn.execute("SELECT lon,lat,type FROM geocode_cache WHERE key=?", (key,))
+        r = cur.fetchone()
+    if r:
+        return float(r[0]), float(r[1]), str(r[2])
     val = resolver()
     if val:
         lon, lat, typ = val
-        cache_put_geo(key, lon, lat, typ)
+        with conn_lock, conn:
+            conn.execute("INSERT OR REPLACE INTO geocode_cache(key,lon,lat,type,created_at) VALUES(?,?,?,?,datetime('now'))",
+                         (key, lon, lat, typ))
         return lon, lat, typ
     return None
 
@@ -402,69 +487,83 @@ def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> L
     coords.append(coords[0])
     return coords
 
-
-def fetch_jma_warnings_prefecture(pref_code: str = "38") -> List[Dict]:
-    return []
-
-# ------------------ Cached fetch/parse/analyze ------------------
+# ------------------ Pipeline ------------------
 @st.cache_data(ttl=FETCH_TTL_SEC)
 def load_police_items() -> List[IncidentItem]:
     txt = http_get_conditional(EHIME_POLICE_URL)
     if txt is None:
-        txt = requests.get(EHIME_POLICE_URL, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT).text
+        txt = http_get(EHIME_POLICE_URL)
     return parse_ehime_police_page(txt)
 
 @st.cache_data(ttl=FETCH_TTL_SEC)
-def analyze_items_cached(items: List[IncidentItem]) -> pd.DataFrame:
-    new_items = [it for it in items if cache_get_nlp(it.id) is None]
-    if new_items:
-        _ = gemini_analyze_many(new_items)
-    rows = [cache_get_nlp(it.id) or {} for it in items]
-    df = pd.DataFrame(rows)
-    return df
+def analyze_items(items: List[IncidentItem], enable_llm: bool) -> pd.DataFrame:
+    rows: List[Dict] = []
+    if enable_llm:
+        new_items = [it for it in items if cache_get_nlp(it.id) is None]
+        if new_items:
+            _ = gemini_analyze_many(new_items)
+        rows = [cache_get_nlp(it.id) or {} for it in items]
+    final_rows: List[Dict] = []
+    for it, base in zip(items, rows if rows else [{}]*len(items)):
+        rb = rule_based_extract(it)
+        if not base:
+            final_rows.append(rb); continue
+        merged = {
+            "category": base.get("category") or rb["category"],
+            "municipality": base.get("municipality") or rb["municipality"],
+            "place_strings": base.get("place_strings") or rb["place_strings"],
+            "road_refs": base.get("road_refs") or rb["road_refs"],
+            "occurred_date": base.get("occurred_date") or rb["occurred_date"],
+            "occurred_time_text": base.get("occurred_time_text") or rb["occurred_time_text"],
+            "summary_ja": base.get("summary_ja") or rb["summary_ja"],
+            "confidence": base.get("confidence", 0.6),
+            "raw_heading": it.heading,
+            "raw_snippet": it.body[:200],
+            "source_url": it.source_url,
+            "fetched_at": it.fetched_at,
+            "id": it.id,
+        }
+        final_rows.append(merged)
+    return pd.DataFrame(final_rows)
 
-# ------------------ Run pipeline ------------------
+# ------------------ Run ------------------
 with st.spinner("県警速報の取得・解析中..."):
     items = load_police_items()
-    an_df = analyze_items_cached(items)
+    an_df = analyze_items(items, enable_llm=use_llm)
 
-# ---- Defensive defaults: ensure required columns exist ----
-REQUIRED_COLS: Dict[str, object] = {
-    "category": "その他",
-    "municipality": None,
-    "place_strings": [],
-    "road_refs": [],
-    "occurred_date": None,
-    "occurred_time_text": None,
-    "summary_ja": None,
-    "confidence": 0.4,
-    "raw_heading": None,
-    "raw_snippet": None,
-    "source_url": EHIME_POLICE_URL,
-    "fetched_at": jst_now_iso(),
-    "id": None,
-}
+# ---- Defensive cols ----
+REQUIRED_COLS = {"category":"その他","municipality":None,"place_strings":[],"road_refs":[],
+                 "occurred_date":None,"occurred_time_text":None,"summary_ja":None,
+                 "confidence":0.4,"raw_heading":None,"raw_snippet":None,
+                 "source_url":EHIME_POLICE_URL,"fetched_at":jst_now_iso(),"id":None}
 if an_df is None or an_df.empty:
-    # create empty frame with required columns
-    an_df = pd.DataFrame([{k: v for k, v in REQUIRED_COLS.items()}]).iloc[0:0].copy()
+    an_df = pd.DataFrame([{k:v for k,v in REQUIRED_COLS.items()}]).iloc[0:0].copy()
 else:
     for col, default in REQUIRED_COLS.items():
         if col not in an_df.columns:
             an_df[col] = default
 
-# ---- Filters (guard against missing) ----
-if "occurred_date" in an_df.columns and not an_df.empty:
-    an_df["occurred_date"] = pd.to_datetime(an_df["occurred_date"], errors="coerce")
-    min_date = pd.to_datetime(an_df["occurred_date"].min())
-    max_date = pd.to_datetime(an_df["occurred_date"].max())
-    if pd.notna(min_date) and pd.notna(max_date):
-        dr = st.sidebar.date_input("発生日フィルタ", value=(min_date.date(), max_date.date()))
-        if isinstance(dr, tuple) and len(dr) == 2:
-            d0, d1 = pd.to_datetime(dr[0]), pd.to_datetime(dr[1])
-            an_df = an_df[(an_df["occurred_date"] >= d0) & (an_df["occurred_date"] <= d1)]
+# ------------------ Basemap (GSI TileLayer) ------------------
+GSI_TILES = {
+    "GSI 標準 (標準地図)": {
+        "url": "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+        "attribution": "地理院タイル（標準地図）",
+    },
+    "GSI 淡色 (淡色地図)": {
+        "url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
+        "attribution": "地理院タイル（淡色）",
+    },
+    "GSI 航空写真 (オルソ)": {
+        "url": "https://cyberjapandata.gsi.go.jp/xyz/ort/{z}/{x}/{y}.jpg",
+        "attribution": "地理院タイル（オルソ画像）",
+    },
+    "GSI 陰影起伏 (標高表現)": {
+        "url": "https://cyberjapandata.gsi.go.jp/xyz/relief/{z}/{x}/{y}.png",
+        "attribution": "地理院タイル（陰影起伏）",
+    },
+}
 
-cats = sorted([c for c in an_df.get("category", pd.Series(dtype=str)).dropna().unique().tolist() if c])
-st.write(" ".join([f"<span class='chip on'>{c}</span>" for c in cats]), unsafe_allow_html=True)
+use_google_iframe = (BASEMAP == "Google Maps (実験・別枠)") and bool(GOOGLE_MAPS_API_KEY)
 
 # ---- Gazetteer ----
 gaz_df = load_gazetteer(gazetteer_path) if gazetteer_path else None
@@ -511,7 +610,7 @@ for _, row in an_df.iterrows():
             def _resolve_osm():
                 ll = nominatim_geocode(ptxt, municipality)
                 if ll:
-                    return ll[0], ll[1], classify_place(ptxt)
+                    return ll[0], ll[1], "facility"
                 return None
             lonlat_typ = geocode_with_cache(idx, key, _resolve_osm)
             if lonlat_typ:
@@ -526,18 +625,20 @@ for _, row in an_df.iterrows():
             lonlat_typ = geocode_with_cache(idx, key, _resolve_osm_city)
 
     if not lonlat_typ:
-        continue
+        lonlat_typ = (EHIME_PREF_LON, EHIME_PREF_LAT, "pref")
+        radius_m = 5000
+    else:
+        radius_m = decide_radius_m(lonlat_typ[2])
 
     lon, lat, mtype = lonlat_typ
-    radius_m = decide_radius_m(mtype)
-    conf = float(row.get("confidence", 0.4))
-    color = [255, 140, 0, int(40 + min(160, conf * 160))]
+    conf = float(row.get("confidence", 0.4) or 0.4)
+    color = [255, 140, 0, int(50 + min(160, conf * 160))]
 
     props = {
         "c": row.get("category", "その他"),
-        "s": (row.get("summary_ja") or "")[:120],
+        "s": (row.get("summary_ja") or row.get("raw_heading") or "")[:140],
         "m": municipality,
-        "u": row.get("source_url"),
+        "u": row.get("source_url") or EHIME_POLICE_URL,
         "t": row.get("fetched_at"),
         "f": round(conf, 2),
         "r": radius_m,
@@ -550,54 +651,72 @@ for _, row in an_df.iterrows():
 
 geojson = {"type": "FeatureCollection", "features": features}
 
-view_state = pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9)
-layer_incidents = pdk.Layer(
-    "GeoJsonLayer",
-    data=geojson,
-    pickable=True,
-    stroked=True,
-    filled=True,
-    get_line_width=2,
-    get_line_color=[230, 90, 20],
-    get_fill_color="properties._fill",
-    auto_highlight=True,
-)
-
-layers = []
-if show_accidents or show_crimes:
-    layers.append(layer_incidents)
-
-tooltip = {
-    "html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
-    "style": {"backgroundColor": "#111", "color": "white"},
-}
-
-deck = pdk.Deck(layers=layers, initial_view_state=view_state, tooltip=tooltip)
-
+# ------------------ Render ------------------
 col_map, col_feed = st.columns([7, 5], gap="large")
+
 with col_map:
-    st.pydeck_chart(deck, use_container_width=True)
-    st.markdown(
-        """
-        <div class='legend'>
-          <span class='chip'>凡例</span> 円は「近似範囲」です（ピンポイントではありません）。
-          出典URLと取得時刻を必ず確認してください。
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if use_google_iframe:
+        # Google Maps は iframe 埋め込み（オーバーレイは別ペインに表示）
+        st.markdown(
+            f"""
+            <div class='note'>Google Maps は実験的表示です（オーバーレイ不可）。
+            国土地理院タイルは上のセレクタで選べます。APIキーの利用規約に従ってください。</div>
+            <iframe width="100%" height="650" frameborder="0" style="border:0"
+                referrerpolicy="no-referrer-when-downgrade"
+                src="https://www.google.com/maps/embed/v1/view?key={GOOGLE_MAPS_API_KEY}&center={EHIME_PREF_LAT},{EHIME_PREF_LON}&zoom=9&maptype=roadmap" allowfullscreen>
+            </iframe>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        # GSI タイル + インシデント GeoJsonLayer
+        tile_info = GSI_TILES[BASEMAP]
+        tile_layer = pdk.Layer(
+            "TileLayer",
+            data=tile_info["url"],
+            min_zoom=0,
+            max_zoom=18,
+            tile_size=256,
+            opacity=1.0,
+        )
+        incident_layer = pdk.Layer(
+            "GeoJsonLayer",
+            data=geojson,
+            pickable=True,
+            stroked=True,
+            filled=True,
+            get_line_width=2,
+            get_line_color=[230, 90, 20],
+            get_fill_color="properties._fill",
+            auto_highlight=True,
+        )
+        layers = [tile_layer]
+        if show_accidents or show_crimes:
+            layers.append(incident_layer)
+        tooltip = {"html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
+                   "style": {"backgroundColor": "#111", "color": "white"}}
+        deck = pdk.Deck(
+            layers=layers,
+            initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9),
+            tooltip=tooltip,
+            map_provider=None,  # 既定のMapboxを無効化
+        )
+        st.pydeck_chart(deck, use_container_width=True)
+        st.caption(f"地図出典: {tile_info['attribution']} / 国土地理院")
 
 with col_feed:
     st.subheader("オーバーレイ要約（速報）")
     cats = sorted([c for c in an_df.get("category", pd.Series(dtype=str)).dropna().unique().tolist() if c])
-    cats_filter = st.multiselect("カテゴリ絞込", options=cats, default=cats)
+    default_cats = cats if cats else ["交通事故","事件","窃盗","詐欺","死亡事案","火災","その他"]
+    cats_filter = st.multiselect("カテゴリ絞込", options=default_cats, default=default_cats)
+
     feed = an_df.copy()
     if cats_filter and "category" in feed.columns:
         feed = feed[feed["category"].isin(cats_filter)]
 
-    q = st.text_input("キーワード検索（要約/原文）")
+    q = st.text_input("キーワード検索（要約/原文/見出し）")
     if q:
-        feed = feed[feed.apply(lambda r: (q in (r.get("summary_ja") or "")) or (q in (r.get("raw_snippet") or "")), axis=1)]
+        feed = feed[feed.apply(lambda r: (q in (r.get("summary_ja") or "")) or (q in (r.get("raw_snippet") or "")) or (q in (r.get("raw_heading") or "")), axis=1)]
 
     PAGE_SIZE = 12
     total = len(feed)
@@ -608,17 +727,15 @@ with col_feed:
     for _, r in feed.iloc[start:end].iterrows():
         st.markdown("<div class='feed-card'>", unsafe_allow_html=True)
         st.markdown(f"**{r.get('category','その他')}**")
-        st.caption(r.get("summary_ja") or "要約なし")
+        st.caption(r.get("summary_ja") or (r.get("raw_heading") or "要約なし"))
         st.caption(f"{r.get('municipality') or '市町村不明'} / 取得: {r.get('fetched_at')} / conf: {r.get('confidence')}")
         st.link_button("出典を開く", r.get("source_url") or EHIME_POLICE_URL, help="県警ページ")
         st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption(
-    "出典: 愛媛県警 事件事故速報 / Geocoding: Gazetteer→OSM(Nominatim). このアプリは参考情報であり、正確性を保証しません。緊急時は110/119へ。"
-)
+st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル または Google Maps（実験）。このアプリは参考情報であり、正確性を保証しません。緊急時は110/119へ。")
 
-# requirements.txt (unchanged)
+# requirements.txt（追加なし）
 # streamlit
 # pandas
 # pydeck
