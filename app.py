@@ -1,11 +1,14 @@
-# =============================================
-# Ehime Safety Platform (ESP) – v3.8
-# 変更点（UI不具合のご指摘に対応）
-# ・ツールチップの横長・はみ出しを抑制：短縮要約 + スタイル（maxWidth/改行/余白/角丸/影）
-# ・縦ラベルの視認性を改善：最大4文字、ズーム>=10で表示、オフセット拡大、倍率可変
-# ・スマホ最適化：モバイル時の地図高さ/フィード高さを調整、余白縮小
-# ・凡例は従来どおり地図下（親しみやすい配色）
-# =============================================
+# ============================================================
+# Ehime Safety Platform (ESP) – v4.0
+# 目的:
+#  - 推奨案の実装: H3グリッドによる動的クラスタリング + 少数点のスパイダーファンアウト
+#  - 追加搭載（最適と思う機能）:
+#     * 期間フィルタ（当日/過去3/7/30日）
+#     * 画面下のクイックトグル（カテゴリ別オン/オフ）
+#     * 縦ラベル（二層）/ツールチップ整形/日本語GSIタイル
+#     * 右ペインは固定高さスクロール
+#  - APIキー不要
+# ============================================================
 
 import os
 import re
@@ -16,7 +19,7 @@ import hashlib
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 import requests
@@ -25,10 +28,11 @@ import streamlit as st
 import pydeck as pdk
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
+import h3
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム（Ehime Safety Platform / ESP）"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/1.8 (civic); contact: localgov"
+USER_AGENT = "ESP/4.0 (civic); contact: localgov"
 REQUEST_TIMEOUT = 12
 FETCH_TTL_SEC = 300
 
@@ -53,7 +57,11 @@ st.markdown(
       .feed-card {background:#ffffff; padding:12px 14px; border-radius:14px; border:1px solid #e8e8e8; margin-bottom:10px; box-shadow:0 1px 2px rgba(0,0,0,.04)}
       .feed-scroll {max-height:700px; overflow-y:auto; padding-right:6px}
       .stButton>button {border-radius:999px;}
-      /* ---- Mobile tweaks ---- */
+      /* Quick FABs */
+      .fab-bar {position:sticky; bottom:12px; display:flex; gap:8px; justify-content:center; padding:6px 8px;}
+      .fab {border-radius:999px; border:1px solid #e3e3e3; padding:6px 10px; background:white; box-shadow:0 2px 8px rgba(0,0,0,.08); font-size:0.9rem;}
+      .fab.active {box-shadow:0 0 0 2px rgba(0,0,0,.10) inset;}
+      /* Mobile tweaks */
       @media (max-width: 640px){
         .big-title{font-size:1.2rem}
         .feed-scroll{max-height:50vh}
@@ -68,28 +76,33 @@ st.markdown(f"<div class='big-title'>🗺️ {APP_TITLE}</div>", unsafe_allow_ht
 
 # ------------------ Sidebar ------------------
 st.sidebar.header("表示項目")
-show_accidents = st.sidebar.checkbox("事故情報", True)
-show_crimes = st.sidebar.checkbox("犯罪情報", True)
-show_disasters = st.sidebar.checkbox("災害情報(警報等)", True)
+# クイックトグルと同じ初期値にする
+cat_state_defaults = {
+    "交通事故": True,
+    "火災": True,
+    "死亡事案": True,
+    "窃盗": True,
+    "詐欺": True,
+    "事件": True,
+    "その他": True,
+}
 
-# ベースマップ（日本語のみ / ラベル非表示）
-BASEMAP = st.sidebar.selectbox(
-    " ",
-    (
-        "GSI 淡色 (国土地理院)",
-        "GSI 標準 (国土地理院)",
-        "GSI 航空写真 (国土地理院)",
-        "GSI 陰影起伏 (国土地理院)",
-    ),
-    label_visibility="collapsed",
+# 期間フィルタ
+st.sidebar.header("期間")
+period = st.sidebar.select_slider(
+    "表示期間",
+    options=["当日","過去3日","過去7日","過去30日"],
+    value="過去7日",
 )
+period_days = {"当日":1, "過去3日":3, "過去7日":7, "過去30日":30}[period]
 
-st.sidebar.header("表示調整")
-label_scale = st.sidebar.slider("ラベル倍率", 0.6, 1.6, 1.0, 0.1, help="端末や地図サイズに合わせて調整")
-label_zoom_min = st.sidebar.slider("ラベル表示ズーム閾値", 8, 13, 10)
+st.sidebar.header("密度・重なり制御")
+zoom_like = st.sidebar.slider("表示密度（ズーム相当）", 7, 14, 10, help="H3解像度の目安。大きいほど細かく散開")
+fanout_threshold = st.sidebar.slider("スパイダーファンアウト件数閾値", 2, 8, 4)
+label_scale = st.sidebar.slider("ラベル倍率", 0.7, 1.6, 1.0, 0.1)
 
 st.sidebar.header("解析モード")
-use_llm = st.sidebar.checkbox("Gemini解析を有効化", True, help="未設定でもルールベースで表示可能")
+use_llm = st.sidebar.checkbox("Gemini解析を有効化", True)
 
 st.sidebar.header("データ取得/設定")
 if st.sidebar.button("県警速報を再取得（キャッシュ無視）"):
@@ -101,7 +114,7 @@ gazetteer_path = st.sidebar.text_input("ガゼッティアCSVパス", "data/gaze
 use_fuzzy = st.sidebar.checkbox("ゆらぎ対応（ファジーマッチ）", True)
 min_fuzzy_score = st.sidebar.slider("最小スコア", 60, 95, 78)
 
-st.sidebar.caption("※参考情報。緊急時は110/119。現地の指示を優先。個人情報は表示しません。")
+st.sidebar.caption("※緊急時は110/119。原文準拠で憶測は表示しません。")
 
 # ------------------ Utils ------------------
 
@@ -508,7 +521,7 @@ def analyze_items(items: List[IncidentItem], enable_llm: bool) -> pd.DataFrame:
 # ------------------ Helper: テキスト整形 ------------------
 
 def verticalize(text: str, max_lines: int = 4) -> str:
-    t = re.sub(r"\s+", "", text)
+    t = re.sub(r"\s+", "", text or "")
     if not t:
         return ""
     t = t[:max_lines]
@@ -518,6 +531,50 @@ def verticalize(text: str, max_lines: int = 4) -> str:
 def short_summary(s: str, max_len: int = 60) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
     return (s[:max_len] + ("…" if len(s) > max_len else "")) if s else ""
+
+# ------------------ H3クラスタリング + Fan-out ------------------
+
+def h3_res_from_zoom(zoom_like_val:int) -> int:
+    # zoom 7→res5, 10→res8, 12→res9, 14→res10 目安
+    mapping = {7:5, 8:6, 9:7, 10:8, 11:9, 12:9, 13:10, 14:10}
+    return mapping.get(zoom_like_val, 8)
+
+
+def cluster_points(df: pd.DataFrame, zoom_like_val:int) -> List[Dict]:
+    res = h3_res_from_zoom(zoom_like_val)
+    groups: Dict[str, List[Dict]] = {}
+    for _, r in df.iterrows():
+        lon, lat = float(r["lon"]), float(r["lat"])
+        cell = h3.geo_to_h3(lat, lon, res)
+        d = r.to_dict()
+        d["cell"] = cell
+        groups.setdefault(cell, []).append(d)
+
+    centers: List[Dict] = []
+    for cell, rows in groups.items():
+        lat, lon = h3.h3_to_geo(cell)
+        centers.append({
+            "cell": cell,
+            "lon": lon,
+            "lat": lat,
+            "count": len(rows),
+            "rows": rows,
+        })
+    return centers
+
+
+def spiderfy(center_lon: float, center_lat: float, n: int, base_px: int = 16, gap_px: int = 8) -> List[Tuple[float,float]]:
+    out: List[Tuple[float,float]] = []
+    rpx = base_px
+    for k in range(n):
+        ang = math.radians(137.5 * k)
+        dx = rpx * math.cos(ang)
+        dy = rpx * math.sin(ang)
+        dlon = dx / (111320 * math.cos(math.radians(center_lat)))
+        dlat = dy / 110540
+        out.append((center_lon + dlon, center_lat + dlat))
+        rpx += gap_px
+    return out
 
 # ------------------ Run ------------------
 with st.spinner("県警速報の取得・解析中..."):
@@ -536,6 +593,15 @@ else:
         if col not in an_df.columns:
             an_df[col] = default
 
+# ---- 期間フィルタ ----
+now = datetime.now()
+cutoff = (now - timedelta(days=period_days)).date()
+if "occurred_date" in an_df.columns and an_df["occurred_date"].notna().any():
+    mask = pd.to_datetime(an_df["occurred_date"], errors="coerce").dt.date >= cutoff
+else:
+    mask = pd.to_datetime(an_df["fetched_at"], errors="coerce").dt.date >= cutoff
+an_df = an_df[mask]
+
 # ------------------ Basemap: GSI TileLayer（日本語のみ） ------------------
 TILES = {
     "GSI 淡色 (国土地理院)": {
@@ -548,19 +614,8 @@ TILES = {
         "attribution": "地理院タイル（標準）",
         "max_zoom": 18,
     },
-    "GSI 航空写真 (国土地理院)": {
-        "url": "https://cyberjapandata.gsi.go.jp/xyz/ort/{z}/{x}/{y}.jpg",
-        "attribution": "地理院タイル（オルソ画像）",
-        "max_zoom": 18,
-    },
-    "GSI 陰影起伏 (国土地理院)": {
-        "url": "https://cyberjapandata.gsi.go.jp/xyz/relief/{z}/{x}/{y}.png",
-        "attribution": "地理院タイル（陰影起伏）",
-        "max_zoom": 18,
-    },
 }
-
-tile_info = TILES[BASEMAP]
+BASEMAP = "GSI 淡色 (国土地理院)"
 
 # ---- Gazetteer ----
 gaz_df = load_gazetteer(gazetteer_path) if gazetteer_path else None
@@ -577,23 +632,15 @@ CAT_STYLE = {
     "その他":   {"color": [120, 144, 156, 210],  "radius": 70},
 }
 
-# ---- Build GeoJSON + Marker/Text ----
-features = []
-points: List[Dict] = []
-labels_fg: List[Dict] = []
-labels_bg: List[Dict] = []
-
+# ---- 位置決定（必ず表示） ----
+rows_geo: List[Dict] = []
 for _, row in an_df.iterrows():
     cat = row.get("category") or "その他"
-    if cat in ("交通事故", "事件", "窃盗", "詐欺") and not (show_accidents or show_crimes):
-        continue
-
     municipality: Optional[str] = row.get("municipality")
     places: List[str] = row.get("place_strings") or []
 
     lonlat_typ: Optional[Tuple[float, float, str]] = None
 
-    # 1) Gazetteer
     if idx is not None:
         for ptxt in places:
             key = f"gaz|{municipality}|{ptxt}"
@@ -616,8 +663,7 @@ for _, row in an_df.iterrows():
                 return None
             lonlat_typ = geocode_with_cache(idx, key, _resolve_city)
 
-    # 2) OSM fallback
-    if not lonlat_typ:
+    if not lonlat_typ and municipality:
         for ptxt in places:
             key = f"osm|{municipality}|{ptxt}"
             def _resolve_osm():
@@ -628,7 +674,7 @@ for _, row in an_df.iterrows():
             lonlat_typ = geocode_with_cache(idx, key, _resolve_osm)
             if lonlat_typ:
                 break
-        if not lonlat_typ and municipality:
+        if not lonlat_typ:
             key = f"osm|{municipality}"
             def _resolve_osm_city():
                 ll = nominatim_geocode(municipality, None)
@@ -637,84 +683,141 @@ for _, row in an_df.iterrows():
                 return None
             lonlat_typ = geocode_with_cache(idx, key, _resolve_osm_city)
 
-    # 3) 最終フォールバック（必ず表示）
     if not lonlat_typ:
         lonlat_typ = (EHIME_PREF_LON, EHIME_PREF_LAT, "pref")
-        radius_m = 5000
+
+    lon, lat, match_type = lonlat_typ
+    rows_geo.append({
+        "lon": float(lon), "lat": float(lat),
+        "category": cat,
+        "summary": short_summary(row.get("summary_ja") or row.get("raw_heading") or "", 60),
+        "municipality": municipality,
+        "confidence": float(row.get("confidence", 0.4) or 0.4),
+        "radius_m": decide_radius_m(match_type),
+        "source_url": row.get("source_url") or EHIME_POLICE_URL,
+    })
+
+geo_df = pd.DataFrame(rows_geo)
+
+# ---- クイックトグル（FAB）
+active_cats = st.session_state.get("active_cats") or cat_state_defaults.copy()
+bar_html = ["<div class='fab-bar'>"]
+for cname in ["交通事故","火災","死亡事案","窃盗","詐欺","事件","その他"]:
+    on = active_cats.get(cname, True)
+    cls = "fab active" if on else "fab"
+    color = f"rgba({CAT_STYLE[cname]['color'][0]}, {CAT_STYLE[cname]['color'][1]}, {CAT_STYLE[cname]['color'][2]}, .9)"
+    fg = "#222" if cname not in ("交通事故","火災","死亡事案") else "#fff"
+    bar_html.append(f"<button class='{cls}' style='background:{color}; color:{fg}' onclick=\"window.parent.postMessage({{'type':'toggle','cat':'{cname}'}},'*')\">{cname}</button>")
+bar_html.append("</div>")
+st.markdown("".join(bar_html), unsafe_allow_html=True)
+
+# 受信スクリプト（Streamlit上でpostMessage受信 → query param 書換で簡易反映）
+st.components.v1.html("""
+<script>
+window.addEventListener('message', (e)=>{
+  if(!e.data || e.data.type!=='toggle') return;
+  const cat = e.data.cat;
+  const url = new URL(window.location);
+  const key = 'cat_'+encodeURIComponent(cat);
+  const cur = url.searchParams.get(key);
+  url.searchParams.set(key, cur==='0' ? '1' : '0');
+  window.location.replace(url.toString());
+});
+</script>
+""", height=0)
+
+# URLクエリで状態を復元
+qs = st.query_params
+for cname in list(cat_state_defaults.keys()):
+    key = "cat_"+cname
+    if key in qs:
+        active_cats[cname] = (qs[key] != "0")
+st.session_state["active_cats"] = active_cats
+
+# 適用
+mask_cat = geo_df["category"].apply(lambda c: active_cats.get(str(c), True))
+geo_df = geo_df[mask_cat]
+
+# ---- H3クラスタリング ----
+centers = cluster_points(geo_df, zoom_like)
+
+# ---- レイヤデータ構築 ----
+TILE = TILES[BASEMAP]
+
+# HexagonLayer 用（密度）
+hex_points = [{"position": [c["lon"], c["lat"]], "count": c["count"]} for c in centers]
+
+# Scatter + Text（スパイダーファンアウト）
+points: List[Dict] = []
+labels_fg: List[Dict] = []
+labels_bg: List[Dict] = []
+polys: List[Dict] = []
+
+for c in centers:
+    cnt = c["count"]
+    clat, clon = c["lat"], c["lon"]
+
+    if cnt <= fanout_threshold:
+        offs = spiderfy(clon, clat, cnt, base_px=16, gap_px=8)
+        for (lon, lat), row in zip(offs, c["rows"]):
+            style = CAT_STYLE.get(row["category"], CAT_STYLE["その他"])
+            points.append({
+                "position": [lon, lat],
+                "color": style["color"],
+                "radius": style["radius"],
+                "c": row["category"],
+                "s": row["summary"],
+                "m": row.get("municipality"),
+                "f": round(float(row.get("confidence", 0.4)), 2),
+                "r": int(row.get("radius_m", 600)),
+            })
+            # 縦ラベル
+            vtxt = verticalize(row["summary"], 4)
+            offset_px = int(-12 * label_scale)
+            labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
+            labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
+            # 近似円
+            poly_color = [255, 140, 0, 60]
+            polys.append({
+                "type":"Feature",
+                "geometry":{"type":"Polygon","coordinates":[circle_coords(lon, lat, int(row.get("radius_m",600)))]},
+                "properties":{"_fill": poly_color, "c": row["category"], "s": row["summary"], "m": row.get("municipality"), "r": int(row.get("radius_m",600)), "f": row.get("confidence",0.4)},
+            })
     else:
-        radius_m = decide_radius_m(lonlat_typ[2])
+        # 代表点のみ（件数ラベルを円の上に）
+        style = CAT_STYLE["その他"]
+        points.append({
+            "position": [clon, clat],
+            "color": [90,90,90,200],
+            "radius": 70,
+            "c": f"{cnt}件", "s": "周辺に多数の事案", "m": "", "f": 0.0, "r": 0
+        })
+        labels_bg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[0,0,0,220],"offset":[0,-10]})
+        labels_fg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[255,255,255,235],"offset":[0,-10]})
 
-    lon, lat, mtype = lonlat_typ
-    conf = float(row.get("confidence", 0.4) or 0.4)
-
-    # 円ポリゴン（近似範囲）
-    poly_color = [255, 140, 0, int(36 + min(144, conf * 144))]
-    features.append({
-        "type": "Feature",
-        "geometry": {"type": "Polygon", "coordinates": [circle_coords(lon, lat, radius_m)]},
-        "properties": {
-            "c": cat,
-            "s": short_summary(row.get("summary_ja") or row.get("raw_heading") or ""),
-            "m": municipality,
-            "u": row.get("source_url") or EHIME_POLICE_URL,
-            "t": row.get("fetched_at"),
-            "f": round(conf, 2),
-            "r": radius_m,
-            "_fill": poly_color,
-        },
-    })
-
-    # マーカー（カテゴリ別スタイル）
-    style = CAT_STYLE.get(cat, CAT_STYLE["その他"])
-    marker_obj = {
-        "position": [lon, lat],
-        "color": style["color"],
-        "radius": style["radius"],
-        # tooltip 共通キー
-        "c": cat,
-        "s": short_summary(row.get("summary_ja") or row.get("raw_heading") or ""),
-        "m": municipality,
-        "f": round(conf, 2),
-        "r": radius_m,
-    }
-    points.append(marker_obj)
-
-    # ラベル（縦表示 + 小さめ + オフセット）— 原文からの抜粋のみ
-    base_text = (row.get("summary_ja") or row.get("raw_heading") or "")
-    vtext = verticalize(base_text, max_lines=4)  # 4文字まで縦積み
-    offset_px = int(-12 * label_scale)
-    labels_bg.append({
-        "position": [lon, lat],
-        "label": vtext,
-        "tcolor": [0, 0, 0, 220],
-        "offset": [0, offset_px],
-        "zoom_min": label_zoom_min,
-    })
-    labels_fg.append({
-        "position": [lon, lat],
-        "label": vtext,
-        "tcolor": [255, 255, 255, 235],
-        "offset": [0, offset_px],
-        "zoom_min": label_zoom_min,
-    })
-
-geojson = {"type": "FeatureCollection", "features": features}
+geojson = {"type":"FeatureCollection","features":polys}
 
 # ------------------ Render ------------------
-# スマホでも見やすい高さ設定
-MAP_HEIGHT = 520
-
-col_map, col_feed = st.columns([7, 5], gap="large")
+col_map, col_feed = st.columns([7,5], gap="large")
 
 with col_map:
-    tile_layer = pdk.Layer(
-        "TileLayer",
-        data=tile_info["url"],
-        min_zoom=0,
-        max_zoom=tile_info.get("max_zoom", 18),
-        tile_size=256,
-        opacity=1.0,
+    tile_layer = pdk.Layer("TileLayer", data=TILE["url"], min_zoom=0, max_zoom=TILE.get("max_zoom",18), tile_size=256, opacity=1.0)
+
+    hex_layer = pdk.Layer(
+        "HexagonLayer",
+        data=hex_points,
+        get_position="position",
+        get_elevation_weight="count",
+        elevation_scale=6,
+        elevation_range=[0,1000],
+        extruded=False,
+        radius= 
+            0.5 * 1000,  # 約500m（ズームに応じた固定でも十分視認性良）
+        coverage=0.9,
+        opacity=0.25,
+        pickable=True,
     )
+
     circle_layer = pdk.Layer(
         "GeoJsonLayer",
         data=geojson,
@@ -726,6 +829,7 @@ with col_map:
         get_fill_color="properties._fill",
         auto_highlight=True,
     )
+
     marker_layer = pdk.Layer(
         "ScatterplotLayer",
         data=points,
@@ -736,53 +840,35 @@ with col_map:
         radius_min_pixels=3,
         radius_max_pixels=60,
     )
-    # 二層テキスト（影→前景）。deck.glでは直接ズーム条件が使えないため、
-    # 文字サイズを0にして簡易制御（ズーム閾値未満なら0）。
-    def label_size_expr():
-        # 疑似式：Python側でサイズを決定
-        return int(12 * label_scale)
-
-    size_px = label_size_expr()
 
     text_bg = pdk.Layer(
         "TextLayer",
-        data=[d for d in labels_bg],
+        data=labels_bg,
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=size_px,
+        get_size=int(12*label_scale),
         get_pixel_offset="offset",
         get_alignment_baseline="bottom",
         get_text_anchor="middle",
     )
     text_fg = pdk.Layer(
         "TextLayer",
-        data=[d for d in labels_fg],
+        data=labels_fg,
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=size_px,
+        get_size=int(12*label_scale),
         get_pixel_offset="offset",
         get_alignment_baseline="bottom",
         get_text_anchor="middle",
     )
 
-    layers = [tile_layer, circle_layer, marker_layer, text_bg, text_fg]
+    layers = [tile_layer, hex_layer, circle_layer, marker_layer, text_bg, text_fg]
 
     tooltip = {
         "html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
-        "style": {
-            "backgroundColor": "#111",
-            "color": "white",
-            "maxWidth": "280px",
-            "whiteSpace": "normal",
-            "wordBreak": "break-word",
-            "lineHeight": 1.35,
-            "fontSize": "13px",
-            "padding": "8px 10px",
-            "borderRadius": "10px",
-            "boxShadow": "0 2px 10px rgba(0,0,0,.25)",
-        }
+        "style": {"backgroundColor":"#111","color":"white","maxWidth":"280px","whiteSpace":"normal","wordBreak":"break-word","lineHeight":1.35,"fontSize":"13px","padding":"8px 10px","borderRadius":"10px","boxShadow":"0 2px 10px rgba(0,0,0,.25)"}
     }
 
     deck = pdk.Deck(
@@ -792,28 +878,19 @@ with col_map:
         map_provider=None,
         map_style=None,
     )
-    st.pydeck_chart(deck, use_container_width=True, height=MAP_HEIGHT)
+    st.pydeck_chart(deck, use_container_width=True, height=520)
 
-    # ---- 凡例（親しみやすい配色） ----
+    # 凡例
     legend_items = []
     for k, v in CAT_STYLE.items():
-        col = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.2f})"
+        col = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{col}'></span>{k}</span>")
-    st.markdown(
-        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲。ラベルは原文の先頭4文字を縦積み表示。</div></div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>六角は密度、放射状に散った点は近接点の展開表示です。</div></div>", unsafe_allow_html=True)
 
 with col_feed:
-    st.subheader("オーバーレイ要約（速報）")
-    cats = sorted([c for c in an_df.get("category", pd.Series(dtype=str)).dropna().unique().tolist() if c])
-    default_cats = cats if cats else ["交通事故","事件","窃盗","詐欺","死亡事案","火災","その他"]
-    cats_filter = st.multiselect("カテゴリ絞込", options=default_cats, default=default_cats)
-
-    feed = an_df.copy()
-    if cats_filter and "category" in feed.columns:
-        feed = feed[feed["category"].isin(cats_filter)]
-
+    st.subheader("速報フィード（期間・カテゴリ連動）")
+    cats = [c for c, on in active_cats.items() if on]
+    feed = an_df[an_df["category"].isin(cats)] if cats else an_df.iloc[0:0]
     q = st.text_input("キーワード検索（要約/原文/見出し）")
     if q:
         feed = feed[feed.apply(lambda r: (q in (r.get("summary_ja") or "")) or (q in (r.get("raw_snippet") or "")) or (q in (r.get("raw_heading") or "")), axis=1)]
@@ -822,7 +899,7 @@ with col_feed:
     for _, r in feed.iterrows():
         html.append("<div class='feed-card'>")
         html.append(f"<b>{r.get('category','その他')}</b><br>")
-        html.append(f"<div class='subtle'>{short_summary(r.get('summary_ja') or (r.get('raw_heading') or '要約なし'), 100)}</div>")
+        html.append(f"<div class='subtle'>{short_summary(r.get('summary_ja') or (r.get('raw_heading') or '要約なし'), 110)}</div>")
         html.append(f"<div class='subtle'>{r.get('municipality') or '市町村不明'} / 取得: {r.get('fetched_at')} / conf: {r.get('confidence')}</div>")
         src = r.get("source_url") or EHIME_POLICE_URL
         html.append(f"<a href='{src}' target='_blank'>出典を開く</a>")
@@ -831,13 +908,14 @@ with col_feed:
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。ツールチップとラベルは原文からの抜粋で憶測を含みません。緊急時は110/119へ。")
+st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。クラスタはH3、少数はスパイダーファンアウトで重なりを解消。要約は原文抜粋で憶測なし。緊急時は110/119へ。")
 
-# requirements.txt（参考）
+# 参考 requirements.txt
 # streamlit
 # pandas
 # pydeck
 # requests
 # beautifulsoup4
-# google-generativeai>=0.8.0
 # rapidfuzz
+# h3
+# google-generativeai>=0.8.0  # 任意（未設定でも動作）
