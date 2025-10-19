@@ -3,5 +3,5 @@ pandas
 pydeck
 requests
 beautifulsoup4
-google-generativeai>=0.8.0
+google-generativeai>=0.8.0   # なくても動きます（LLMオフでルール抽出）
 rapidfuzz
