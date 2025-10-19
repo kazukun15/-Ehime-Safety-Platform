@@ -1,1 +1,9 @@
-
+# streamlit用 requirements.txt （ESP v2）
+streamlit
+pandas
+pydeck
+requests
+beautifulsoup4
+google-generativeai>=0.8.0
+rapidfuzz
+python-dateutil
