@@ -1,9 +1,9 @@
 # =============================================
-# Ehime Safety Platform (ESP) – v3.2
-# ベースマップを「国土地理院（複数スタイル）」または「Google Maps(実験的)」に切替
-# - deck.gl TileLayer を使って GSI タイルを表示
-# - Google Maps は埋め込み(iframe)の実験オプション（APIキー必要、可用性に依存）
-# - 既存のインシデントGeoJsonLayerを重ね合わせ
+# Ehime Safety Platform (ESP) – v3.3 完成版
+# ベースマップ: OpenStreetMap / 国土地理院（APIキー不要、無料）
+# ・Deck.gl TileLayer で OSM/GSI タイルを直接表示（Mapbox不要）
+# ・事故/事件/災害（速報）を円ポリゴンで近似オーバーレイ
+# ・Geminiは任意（未設定でもルールベースで可視化）
 # =============================================
 
 import os
@@ -27,7 +27,7 @@ from rapidfuzz import fuzz, process as rf_process
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム（Ehime Safety Platform / ESP）"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/1.2 (civic); contact: localgov"
+USER_AGENT = "ESP/1.3 (civic); contact: localgov"
 REQUEST_TIMEOUT = 12
 FETCH_TTL_SEC = 300
 
@@ -52,7 +52,6 @@ st.markdown(
       .feed-card {background:#11111110; padding:12px 14px; border-radius:12px; border:1px solid #e0e0e0;}
       .stButton>button {border-radius:999px;}
       .metric-box {background:#f7f7f7; border:1px solid #eee; border-radius:10px; padding:8px 10px;}
-      .note {font-size:0.85rem; color:#666}
     </style>
     """,
     unsafe_allow_html=True,
@@ -66,22 +65,19 @@ show_accidents = st.sidebar.checkbox("事故情報", True)
 show_crimes = st.sidebar.checkbox("犯罪情報", True)
 show_disasters = st.sidebar.checkbox("災害情報(警報等)", True)
 
-st.sidebar.header("ベースマップ")
+st.sidebar.header("ベースマップ（無料・APIキー不要）")
 BASEMAP = st.sidebar.selectbox(
     "地図タイル",
     (
-        "GSI 標準 (標準地図)",
-        "GSI 淡色 (淡色地図)",
-        "GSI 航空写真 (オルソ)",
-        "GSI 陰影起伏 (標高表現)",
-        "Google Maps (実験・別枠)"
+        "OSM 標準 (OpenStreetMap)",
+        "GSI 淡色 (国土地理院)",
+        "GSI 標準 (国土地理院)",
+        "GSI 航空写真 (国土地理院)",
     ),
-    help="原則は国土地理院タイル。GoogleはAPIキーが必要で別枠表示（オーバーレイ非対応）。"
 )
-GOOGLE_MAPS_API_KEY = st.sidebar.text_input("Google Maps API Key（任意）", type="password")
 
 st.sidebar.header("解析モード")
-use_llm = st.sidebar.checkbox("Gemini解析を有効化", True)
+use_llm = st.sidebar.checkbox("Gemini解析を有効化", True, help="未設定でもルールベースで表示可能")
 
 st.sidebar.header("データ取得/設定")
 if st.sidebar.button("県警速報を再取得（キャッシュ無視）"):
@@ -151,23 +147,6 @@ def cache_put_nlp(hid: str, payload: Dict) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO nlp_cache(id,payload,created_at) VALUES(?,?,datetime('now'))",
             (hid, json.dumps(payload, ensure_ascii=False)),
-        )
-
-
-def cache_get_geo(key: str) -> Optional[Tuple[float, float, str]]:
-    with conn_lock:
-        cur = conn.execute("SELECT lon,lat,type FROM geocode_cache WHERE key=?", (key,))
-        r = cur.fetchone()
-    if r:
-        return float(r[0]), float(r[1]), str(r[2])
-    return None
-
-
-def cache_put_geo(key: str, lon: float, lat: float, typ: str) -> None:
-    with conn_lock, conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO geocode_cache(key,lon,lat,type,created_at) VALUES(?,?,?,?,datetime('now'))",
-            (key, lon, lat, typ),
         )
 
 
@@ -345,8 +324,9 @@ def gemini_analyze_many(items: List[IncidentItem]) -> List[Dict]:
             f"summary_ja, confidence, raw_heading, raw_snippet\n"
             f"見出し:{it.heading}\n本文:{it.body}\n推定日:{it.incident_date} 署:{it.station}"
         )
-        gen_cfg = {"temperature": GEMINI_TEMPERATURE, "max_output_tokens": GEMINI_MAX_TOKENS, "response_mime_type": "application/json"}
         try:
+            import google.generativeai as genai  # lazy import guard
+            gen_cfg = {"temperature": GEMINI_TEMPERATURE, "max_output_tokens": GEMINI_MAX_TOKENS, "response_mime_type": "application/json"}
             resp = model.generate_content([
                 {"role": "system", "parts": [SYS]},
                 {"role": "user", "parts": [user]},
@@ -356,7 +336,6 @@ def gemini_analyze_many(items: List[IncidentItem]) -> List[Dict]:
         except Exception:
             data = {}
         base = rule_based_extract(it)
-        # 併合（LLM優先、欠損はルールで補完）
         merged = {
             "category": data.get("category") or base["category"],
             "municipality": data.get("municipality") or base["municipality"],
@@ -460,6 +439,7 @@ def nominatim_geocode(name: str, municipality: Optional[str]) -> Optional[Tuple[
 
 def geocode_with_cache(idx: Optional[GazetteerIndex], key: str, resolver) -> Optional[Tuple[float, float, str]]:
     with conn_lock:
+        # inline cache because we already have sqlite
         cur = conn.execute("SELECT lon,lat,type FROM geocode_cache WHERE key=?", (key,))
         r = cur.fetchone()
     if r:
@@ -543,27 +523,31 @@ else:
         if col not in an_df.columns:
             an_df[col] = default
 
-# ------------------ Basemap (GSI TileLayer) ------------------
-GSI_TILES = {
-    "GSI 標準 (標準地図)": {
-        "url": "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
-        "attribution": "地理院タイル（標準地図）",
+# ------------------ Basemap: OSM/GSI TileLayer ------------------
+TILES = {
+    "OSM 標準 (OpenStreetMap)": {
+        "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "attribution": "© OpenStreetMap contributors",
+        "max_zoom": 19,
     },
-    "GSI 淡色 (淡色地図)": {
+    "GSI 淡色 (国土地理院)": {
         "url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
         "attribution": "地理院タイル（淡色）",
+        "max_zoom": 18,
     },
-    "GSI 航空写真 (オルソ)": {
+    "GSI 標準 (国土地理院)": {
+        "url": "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+        "attribution": "地理院タイル（標準）",
+        "max_zoom": 18,
+    },
+    "GSI 航空写真 (国土地理院)": {
         "url": "https://cyberjapandata.gsi.go.jp/xyz/ort/{z}/{x}/{y}.jpg",
         "attribution": "地理院タイル（オルソ画像）",
-    },
-    "GSI 陰影起伏 (標高表現)": {
-        "url": "https://cyberjapandata.gsi.go.jp/xyz/relief/{z}/{x}/{y}.png",
-        "attribution": "地理院タイル（陰影起伏）",
+        "max_zoom": 18,
     },
 }
 
-use_google_iframe = (BASEMAP == "Google Maps (実験・別枠)") and bool(GOOGLE_MAPS_API_KEY)
+tile_info = TILES[BASEMAP]
 
 # ---- Gazetteer ----
 gaz_df = load_gazetteer(gazetteer_path) if gazetteer_path else None
@@ -655,54 +639,39 @@ geojson = {"type": "FeatureCollection", "features": features}
 col_map, col_feed = st.columns([7, 5], gap="large")
 
 with col_map:
-    if use_google_iframe:
-        # Google Maps は iframe 埋め込み（オーバーレイは別ペインに表示）
-        st.markdown(
-            f"""
-            <div class='note'>Google Maps は実験的表示です（オーバーレイ不可）。
-            国土地理院タイルは上のセレクタで選べます。APIキーの利用規約に従ってください。</div>
-            <iframe width="100%" height="650" frameborder="0" style="border:0"
-                referrerpolicy="no-referrer-when-downgrade"
-                src="https://www.google.com/maps/embed/v1/view?key={GOOGLE_MAPS_API_KEY}&center={EHIME_PREF_LAT},{EHIME_PREF_LON}&zoom=9&maptype=roadmap" allowfullscreen>
-            </iframe>
-            """,
-            unsafe_allow_html=True,
-        )
-    else:
-        # GSI タイル + インシデント GeoJsonLayer
-        tile_info = GSI_TILES[BASEMAP]
-        tile_layer = pdk.Layer(
-            "TileLayer",
-            data=tile_info["url"],
-            min_zoom=0,
-            max_zoom=18,
-            tile_size=256,
-            opacity=1.0,
-        )
-        incident_layer = pdk.Layer(
-            "GeoJsonLayer",
-            data=geojson,
-            pickable=True,
-            stroked=True,
-            filled=True,
-            get_line_width=2,
-            get_line_color=[230, 90, 20],
-            get_fill_color="properties._fill",
-            auto_highlight=True,
-        )
-        layers = [tile_layer]
-        if show_accidents or show_crimes:
-            layers.append(incident_layer)
-        tooltip = {"html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
-                   "style": {"backgroundColor": "#111", "color": "white"}}
-        deck = pdk.Deck(
-            layers=layers,
-            initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9),
-            tooltip=tooltip,
-            map_provider=None,  # 既定のMapboxを無効化
-        )
-        st.pydeck_chart(deck, use_container_width=True)
-        st.caption(f"地図出典: {tile_info['attribution']} / 国土地理院")
+    tile_layer = pdk.Layer(
+        "TileLayer",
+        data=tile_info["url"],
+        min_zoom=0,
+        max_zoom=tile_info.get("max_zoom", 18),
+        tile_size=256,
+        opacity=1.0,
+    )
+    incident_layer = pdk.Layer(
+        "GeoJsonLayer",
+        data=geojson,
+        pickable=True,
+        stroked=True,
+        filled=True,
+        get_line_width=2,
+        get_line_color=[230, 90, 20],
+        get_fill_color="properties._fill",
+        auto_highlight=True,
+    )
+    layers = [tile_layer]
+    if show_accidents or show_crimes:
+        layers.append(incident_layer)
+    tooltip = {"html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
+               "style": {"backgroundColor": "#111", "color": "white"}}
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9),
+        tooltip=tooltip,
+        map_provider=None,  # Mapbox 無効
+        map_style=None,
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+    st.caption(f"地図出典: {tile_info['attribution']}")
 
 with col_feed:
     st.subheader("オーバーレイ要約（速報）")
@@ -733,9 +702,9 @@ with col_feed:
         st.markdown("</div>", unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル または Google Maps（実験）。このアプリは参考情報であり、正確性を保証しません。緊急時は110/119へ。")
+st.caption("出典: 愛媛県警 事件事故速報 / 地図: OpenStreetMap または 国土地理院タイル。参考情報であり、正確性は保証しません。緊急時は110/119へ。")
 
-# requirements.txt（追加なし）
+# requirements.txt（参考）
 # streamlit
 # pandas
 # pydeck
