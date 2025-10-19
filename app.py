@@ -1,12 +1,10 @@
 # =============================================
-# Ehime Safety Platform (ESP) – v3.5
-# 追加修正（ご指定）
-# ・凡例を地図の下にスタイリッシュ表示
-# ・ツールチップのプレースホルダが表示される問題を修正（両Layer共通キー c/s/m/r/f）
-# ・マップ上に要約ラベル（TextLayer）を重ねて表示（元テキスト由来／憶測なし）
-# ・位置解析の最終フォールバックを維持（必ず描画）
-# ・ベースマップ＝国土地理院（日本語）限定／選択UIはラベル非表示
-# ・右ペインは固定高さスクロール（ページ全体スクロール不要）
+# Ehime Safety Platform (ESP) – v3.6
+# 変更点（ご要望反映）
+# ・オーバハンズ（マップ上ラベル）を小さめ（12px）にし、ピクセルオフセットを-8pxへ
+# ・二層テキスト（シャドウ＋前景）でダーク/ライト双方で視認性を確保
+# ・全体配色を親しみやすいパステル寄りに調整（カテゴリ別マーカー）
+# ・凡例はそのまま下部、ツールチップは共通キーで安定
 # =============================================
 
 import os
@@ -30,7 +28,7 @@ from rapidfuzz import fuzz, process as rf_process
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム（Ehime Safety Platform / ESP）"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/1.5 (civic); contact: localgov"
+USER_AGENT = "ESP/1.6 (civic); contact: localgov"
 REQUEST_TIMEOUT = 12
 FETCH_TTL_SEC = 300
 
@@ -48,16 +46,13 @@ st.markdown(
     """
     <style>
       .big-title {font-size:1.6rem; font-weight:700;}
-      .chip {display:inline-block; padding:4px 10px; border-radius:999px; margin:0 6px 6px 0; background:#eceff1; font-size:0.9rem;}
-      .chip.on {background:#1e88e5; color:#fff}
-      .subtle {color:#666}
-      .legend {font-size:0.95rem; background:#fafafa; border:1px solid #eee; border-radius:10px; padding:10px 12px;}
-      .legend .item {display:inline-flex; align-items:center; margin-right:12px; margin-bottom:6px}
-      .dot {width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px; border:1px solid #00000020}
-      .feed-card {background:#11111110; padding:12px 14px; border-radius:12px; border:1px solid #e0e0e0; margin-bottom:10px}
-      .stButton>button {border-radius:999px;}
-      .metric-box {background:#f7f7f7; border:1px solid #eee; border-radius:10px; padding:8px 10px;}
+      .subtle {color:#5f6368}
+      .legend {font-size:0.95rem; background:#fafafa; border:1px solid #eee; border-radius:12px; padding:10px 12px;}
+      .legend .item {display:inline-flex; align-items:center; margin-right:14px; margin-bottom:6px}
+      .dot {width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px; border:1px solid #00000022}
+      .feed-card {background:#ffffff; padding:12px 14px; border-radius:14px; border:1px solid #e8e8e8; margin-bottom:10px; box-shadow:0 1px 2px rgba(0,0,0,.04)}
       .feed-scroll {max-height:700px; overflow-y:auto; padding-right:6px}
+      .stButton>button {border-radius:999px;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -415,18 +410,6 @@ def decide_radius_m(match_type: str) -> int:
     return 1200
 
 
-def classify_place(text: str) -> str:
-    if any(k in text for k in FACILITY_KEYWORDS):
-        return "facility"
-    if "交差点" in text:
-        return "intersection"
-    if text.endswith("町") or text.endswith("丁目"):
-        return "town"
-    if text.endswith("市") or text.endswith("郡"):
-        return "city"
-    return "unknown"
-
-
 def nominatim_geocode(name: str, municipality: Optional[str]) -> Optional[Tuple[float, float]]:
     try:
         q = f"{name} {municipality or ''} 愛媛県 日本".strip()
@@ -559,21 +542,22 @@ tile_info = TILES[BASEMAP]
 gaz_df = load_gazetteer(gazetteer_path) if gazetteer_path else None
 idx = GazetteerIndex(gaz_df) if gaz_df is not None else None
 
-# ---- Category styles (marker color/size) ----
+# ---- Category styles (友好的パステル) ----
 CAT_STYLE = {
-    "交通事故": {"color": [220, 20, 60, 220], "radius": 90},    # crimson
-    "火災":     {"color": [255, 69, 0, 220],  "radius": 95},    # orange-red
-    "死亡事案": {"color": [128, 0, 128, 220],  "radius": 100},   # purple
-    "窃盗":     {"color": [30, 144, 255, 220], "radius": 80},    # dodgerblue
-    "詐欺":     {"color": [0, 128, 0, 220],    "radius": 80},    # green
-    "事件":     {"color": [255, 140, 0, 220],  "radius": 85},    # darkorange
-    "その他":   {"color": [105, 105, 105, 200], "radius": 70},    # dimgray
+    "交通事故": {"color": [235, 87, 87, 220],   "radius": 86},  # soft red
+    "火災":     {"color": [255, 112, 67, 220],  "radius": 88},  # coral
+    "死亡事案": {"color": [171, 71, 188, 220],  "radius": 92},  # purple
+    "窃盗":     {"color": [66, 165, 245, 220],  "radius": 78},  # sky blue
+    "詐欺":     {"color": [38, 166, 154, 220],  "radius": 78},  # teal
+    "事件":     {"color": [255, 202, 40, 220],  "radius": 82},  # amber
+    "その他":   {"color": [120, 144, 156, 210],  "radius": 70},  # blue gray
 }
 
 # ---- Build GeoJSON + Marker/Text ----
 features = []
 points: List[Dict] = []
-labels: List[Dict] = []
+labels_fg: List[Dict] = []
+labels_bg: List[Dict] = []
 
 for _, row in an_df.iterrows():
     cat = row.get("category") or "その他"
@@ -640,7 +624,7 @@ for _, row in an_df.iterrows():
     conf = float(row.get("confidence", 0.4) or 0.4)
 
     # 円ポリゴン（近似範囲）
-    poly_color = [255, 140, 0, int(40 + min(160, conf * 160))]
+    poly_color = [255, 140, 0, int(36 + min(144, conf * 144))]
     features.append({
         "type": "Feature",
         "geometry": {"type": "Polygon", "coordinates": [circle_coords(lon, lat, radius_m)]},
@@ -656,7 +640,7 @@ for _, row in an_df.iterrows():
         },
     })
 
-    # マーカー（カテゴリ別スタイル）— 両Layer共通キーで保持
+    # マーカー（カテゴリ別スタイル）
     style = CAT_STYLE.get(cat, CAT_STYLE["その他"])
     marker_obj = {
         "position": [lon, lat],
@@ -671,13 +655,20 @@ for _, row in an_df.iterrows():
     }
     points.append(marker_obj)
 
-    # マップ上ラベル（要約）— 憶測回避のため原文由来を短縮
+    # ラベル（小さめ＆二層）— 憶測せず原文由来を短縮
     base_text = (row.get("summary_ja") or row.get("raw_heading") or "")
-    label_text = re.sub(r"\s+", " ", base_text)[:12]  # 12文字程度で抑制
-    labels.append({
+    label_text = re.sub(r"\s+", " ", base_text)[:10]  # 10文字程度
+    labels_bg.append({
         "position": [lon, lat],
         "label": label_text,
-        "tcolor": [250, 250, 250, 240],
+        "tcolor": [0, 0, 0, 220],
+        "offset": [0, -8],
+    })
+    labels_fg.append({
+        "position": [lon, lat],
+        "label": label_text,
+        "tcolor": [255, 255, 255, 235],
+        "offset": [0, -8],
     })
 
 geojson = {"type": "FeatureCollection", "features": features}
@@ -715,17 +706,29 @@ with col_map:
         radius_min_pixels=3,
         radius_max_pixels=60,
     )
-    text_layer = pdk.Layer(
+    # 二層テキスト（影→前景）
+    text_bg = pdk.Layer(
         "TextLayer",
-        data=labels,
+        data=labels_bg,
         get_position="position",
         get_text="label",
         get_color="tcolor",
-        get_size=16,
+        get_size=12,
+        get_pixel_offset="offset",
+        get_alignment_baseline="bottom",
+    )
+    text_fg = pdk.Layer(
+        "TextLayer",
+        data=labels_fg,
+        get_position="position",
+        get_text="label",
+        get_color="tcolor",
+        get_size=12,
+        get_pixel_offset="offset",
         get_alignment_baseline="bottom",
     )
 
-    layers = [tile_layer, circle_layer, marker_layer, text_layer]
+    layers = [tile_layer, circle_layer, marker_layer, text_bg, text_fg]
 
     tooltip = {
         "html": "<b>{c}</b><br/>{s}<br/><span class='subtle'>{m}</span><br/>半径:{r}m / conf:{f}",
@@ -734,19 +737,20 @@ with col_map:
 
     deck = pdk.Deck(
         layers=layers,
-        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9),
+        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=132.7650, zoom=9),
         tooltip=tooltip,
-        map_provider=None,  # Mapbox 無効
+        map_provider=None,
         map_style=None,
     )
     st.pydeck_chart(deck, use_container_width=True)
-    # ---- LEGEND ----
+
+    # ---- 凡例（親しみやすい配色） ----
     legend_items = []
     for k, v in CAT_STYLE.items():
         col = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.2f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{col}'></span>{k}</span>")
     st.markdown(
-        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲（中心のラベル・丸は代表点）。</div></div>",
+        f"<div class='legend'>{''.join(legend_items)}<div class='subtle' style='margin-top:6px'>円は近似範囲。小さめの白文字ラベルに黒影を重ねて視認性を確保しています。</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -764,12 +768,10 @@ with col_feed:
     if q:
         feed = feed[feed.apply(lambda r: (q in (r.get("summary_ja") or "")) or (q in (r.get("raw_snippet") or "")) or (q in (r.get("raw_heading") or "")), axis=1)]
 
-    # 固定高さスクロール領域
     html = ["<div class='feed-scroll'>"]
     for _, r in feed.iterrows():
         html.append("<div class='feed-card'>")
         html.append(f"<b>{r.get('category','その他')}</b><br>")
-        # オーバハンズ用と同じ方針：原文由来
         html.append(f"<div class='subtle'>{r.get('summary_ja') or (r.get('raw_heading') or '要約なし')}</div>")
         html.append(f"<div class='subtle'>{r.get('municipality') or '市町村不明'} / 取得: {r.get('fetched_at')} / conf: {r.get('confidence')}</div>")
         src = r.get("source_url") or EHIME_POLICE_URL
@@ -779,7 +781,7 @@ with col_feed:
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
 st.markdown("---")
-st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。要約・ラベルは原文からの抜粋・整形であり、生成的推測は行いません。緊急時は110/119へ。")
+st.caption("出典: 愛媛県警 事件事故速報 / 地図: 国土地理院タイル。マップ上ラベルは原文からの抜粋で憶測を含みません。緊急時は110/119へ。")
 
 # requirements.txt（参考）
 # streamlit
