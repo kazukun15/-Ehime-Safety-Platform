@@ -1,8 +1,7 @@
 # =============================================
-# Ehime Safety Platform (ESP) – v3 (requests-only fix)
-# Streamlit app: Incident/Crime/Disaster Map for Ehime
-# - Replaces httpx with requests to avoid ModuleNotFoundError
-# - Rest is identical to v3 optimized pipeline (diff hashing, caches, etc.)
+# Ehime Safety Platform (ESP) – v3 (robust empty-columns fix)
+# Streamlit app with defensive guards when DataFrame columns are missing
+# (fixes KeyError: 'occurred_date')
 # =============================================
 
 import os
@@ -398,7 +397,7 @@ def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> L
     for i in range(n):
         ang = 2 * math.pi * i / n
         lat_i = lat + math.degrees(dlat * math.sin(ang))
-        lon_i = lon + math.degrees(dlon * math.cos(ang))
+        lon_i = lon + math.degrees(dlon * math.cos(math.radians(lat)))
         coords.append([lon_i, lat_i])
     coords.append(coords[0])
     return coords
@@ -407,6 +406,7 @@ def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> L
 def fetch_jma_warnings_prefecture(pref_code: str = "38") -> List[Dict]:
     return []
 
+# ------------------ Cached fetch/parse/analyze ------------------
 @st.cache_data(ttl=FETCH_TTL_SEC)
 def load_police_items() -> List[IncidentItem]:
     txt = http_get_conditional(EHIME_POLICE_URL)
@@ -420,27 +420,57 @@ def analyze_items_cached(items: List[IncidentItem]) -> pd.DataFrame:
     if new_items:
         _ = gemini_analyze_many(new_items)
     rows = [cache_get_nlp(it.id) or {} for it in items]
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    return df
 
+# ------------------ Run pipeline ------------------
 with st.spinner("県警速報の取得・解析中..."):
     items = load_police_items()
     an_df = analyze_items_cached(items)
 
-an_df["occurred_date"] = pd.to_datetime(an_df["occurred_date"], errors="coerce")
-min_date = pd.to_datetime(an_df["occurred_date"].min())
-max_date = pd.to_datetime(an_df["occurred_date"].max())
-if pd.notna(min_date) and pd.notna(max_date):
-    dr = st.sidebar.date_input("発生日フィルタ", value=(min_date.date(), max_date.date()))
-    if isinstance(dr, tuple) and len(dr) == 2:
-        d0, d1 = pd.to_datetime(dr[0]), pd.to_datetime(dr[1])
-        an_df = an_df[(an_df["occurred_date"] >= d0) & (an_df["occurred_date"] <= d1)]
+# ---- Defensive defaults: ensure required columns exist ----
+REQUIRED_COLS: Dict[str, object] = {
+    "category": "その他",
+    "municipality": None,
+    "place_strings": [],
+    "road_refs": [],
+    "occurred_date": None,
+    "occurred_time_text": None,
+    "summary_ja": None,
+    "confidence": 0.4,
+    "raw_heading": None,
+    "raw_snippet": None,
+    "source_url": EHIME_POLICE_URL,
+    "fetched_at": jst_now_iso(),
+    "id": None,
+}
+if an_df is None or an_df.empty:
+    # create empty frame with required columns
+    an_df = pd.DataFrame([{k: v for k, v in REQUIRED_COLS.items()}]).iloc[0:0].copy()
+else:
+    for col, default in REQUIRED_COLS.items():
+        if col not in an_df.columns:
+            an_df[col] = default
 
-cats = sorted([c for c in an_df["category"].dropna().unique().tolist() if c])
+# ---- Filters (guard against missing) ----
+if "occurred_date" in an_df.columns and not an_df.empty:
+    an_df["occurred_date"] = pd.to_datetime(an_df["occurred_date"], errors="coerce")
+    min_date = pd.to_datetime(an_df["occurred_date"].min())
+    max_date = pd.to_datetime(an_df["occurred_date"].max())
+    if pd.notna(min_date) and pd.notna(max_date):
+        dr = st.sidebar.date_input("発生日フィルタ", value=(min_date.date(), max_date.date()))
+        if isinstance(dr, tuple) and len(dr) == 2:
+            d0, d1 = pd.to_datetime(dr[0]), pd.to_datetime(dr[1])
+            an_df = an_df[(an_df["occurred_date"] >= d0) & (an_df["occurred_date"] <= d1)]
+
+cats = sorted([c for c in an_df.get("category", pd.Series(dtype=str)).dropna().unique().tolist() if c])
 st.write(" ".join([f"<span class='chip on'>{c}</span>" for c in cats]), unsafe_allow_html=True)
 
+# ---- Gazetteer ----
 gaz_df = load_gazetteer(gazetteer_path) if gazetteer_path else None
 idx = GazetteerIndex(gaz_df) if gaz_df is not None else None
 
+# ---- Build GeoJSON ----
 features = []
 for _, row in an_df.iterrows():
     cat = row.get("category")
@@ -559,10 +589,10 @@ with col_map:
 
 with col_feed:
     st.subheader("オーバーレイ要約（速報）")
-    cats = sorted([c for c in an_df["category"].dropna().unique().tolist() if c])
+    cats = sorted([c for c in an_df.get("category", pd.Series(dtype=str)).dropna().unique().tolist() if c])
     cats_filter = st.multiselect("カテゴリ絞込", options=cats, default=cats)
     feed = an_df.copy()
-    if cats_filter:
+    if cats_filter and "category" in feed.columns:
         feed = feed[feed["category"].isin(cats_filter)]
 
     q = st.text_input("キーワード検索（要約/原文）")
@@ -588,7 +618,7 @@ st.caption(
     "出典: 愛媛県警 事件事故速報 / Geocoding: Gazetteer→OSM(Nominatim). このアプリは参考情報であり、正確性を保証しません。緊急時は110/119へ。"
 )
 
-# requirements.txt (for this fixed build)
+# requirements.txt (unchanged)
 # streamlit
 # pandas
 # pydeck
