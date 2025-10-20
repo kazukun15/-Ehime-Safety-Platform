@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム v9.9-A2
-# - JARTIC 凡例を追加
-# - JARTIC 点サイズ拡大
-# - JARTIC 線を常に赤い“渋滞ライン”として見やすく描画（ピクセル幅／フェールセーフ）
-# - 既存機能は維持（速報・交差点ヒート/柱 ON/OFF・OSMスナップ線・フィード など）
+# 愛媛セーフティ・プラットフォーム v9.9-A3
+# - JARTIC ホバー改善：時刻（JST）・合計・上り・下りを表示
+# - 既存機能（JARTIC点/赤い擬似線/フェールセーフ、交差点ON/OFF、速報、フィード等）維持
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -30,7 +28,7 @@ except Exception:
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A2 (jartic+legend+fatlines)"
+USER_AGENT = "ESP/9.9-A3 (jartic-hover)"
 TIMEOUT = 15
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -79,7 +77,7 @@ TILESETS: Dict[str, Dict] = {
 }
 
 # ----------------------------------------------------------------------------
-# Streamlit base UI
+# UI / CSS
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 st.markdown("""
@@ -117,7 +115,7 @@ st.markdown(
 )
 
 # ----------------------------------------------------------------------------
-# Session state defaults
+# Session state
 # ----------------------------------------------------------------------------
 if "map_choice" not in st.session_state:
     st.session_state.map_choice = "標準"
@@ -150,7 +148,7 @@ def cache_put(table:str, key:str, payload:str):
         _conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,datetime('now'))", (key, payload))
 
 # ----------------------------------------------------------------------------
-# Ehime Police parsing (same as before)
+# 県警速報の取得・解析
 # ----------------------------------------------------------------------------
 @dataclass
 class IncidentItem:
@@ -310,7 +308,7 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
     return []
 
 # ----------------------------------------------------------------------------
-# H3 helpers & clustering
+# H3 helpers
 # ----------------------------------------------------------------------------
 def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
     if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)
@@ -370,14 +368,19 @@ JARTIC_WFS_URL = "https://api.jartic-open-traffic.org/geoserver"
 
 def jst_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=9)
+
 def round_to_5min(d: datetime) -> datetime:
     mm = (d.minute // 5) * 5
     return d.replace(minute=mm, second=0, microsecond=0)
 
 @st.cache_data(ttl=180)
-def fetch_jartic_5min(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> Optional[Dict]:
+def fetch_jartic_5min(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> Tuple[Optional[Dict], Optional[str]]:
+    """
+    Returns: (geojson, tlabel) where tlabel is like '2025-10-20 12:35 (JST)'
+    """
     t = round_to_5min(jst_now() - timedelta(minutes=20))
     tcode = t.strftime("%Y%m%d%H%M")
+    tlabel = t.strftime("%Y-%m-%d %H:%M (JST)")
     cql = (
         f"道路種別=3 AND 時間コード={tcode} AND "
         f"BBOX(ジオメトリ,{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]},'EPSG:4326')"
@@ -385,32 +388,46 @@ def fetch_jartic_5min(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> Opti
     params = {
         "service": "WFS", "version": "2.0.0", "request": "GetFeature",
         "typeNames": "t_travospublic_measure_5m",
-        "srsName": "EPSG:4326", "outputFormat": "application/json",
-        "exceptions": "application/json", "cql_filter": cql
+        "srsName": "EPSG:4326",
+        "outputFormat": "application/json",
+        "exceptions": "application/json",
+        "cql_filter": cql
     }
     try:
         r = requests.get(JARTIC_WFS_URL, params=params, timeout=TIMEOUT)
         r.raise_for_status()
-        return r.json()
+        return r.json(), tlabel
     except Exception:
-        return None
+        return None, None
 
-def jartic_features_to_points(geojson: Dict) -> List[Dict]:
+def jartic_features_to_points(geojson: Dict, tlabel: str) -> List[Dict]:
+    """
+    各ポイントにホバー用フィールドを付与:
+      - jt_time, jt_total, jt_up, jt_down
+    """
     if not geojson or "features" not in geojson: return []
     pts: List[Dict] = []
     for f in geojson["features"]:
         g = f.get("geometry") or {}
         if g.get("type") == "MultiPoint":
+            prop = f.get("properties", {}) or {}
+            up = sum(filter(None, [
+                prop.get("上り・小型交通量"), prop.get("上り・大型交通量"), prop.get("上り・車種判別不能交通量")
+            ]))
+            down = sum(filter(None, [
+                prop.get("下り・小型交通量"), prop.get("下り・大型交通量"), prop.get("下り・車種判別不能交通量")
+            ]))
+            up = int(up or 0); down = int(down or 0); total = up + down
             for lon, lat in g.get("coordinates", []):
-                prop = f.get("properties", {})
-                up = sum(filter(None, [
-                    prop.get("上り・小型交通量"), prop.get("上り・大型交通量"), prop.get("上り・車種判別不能交通量")
-                ]))
-                down = sum(filter(None, [
-                    prop.get("下り・小型交通量"), prop.get("下り・大型交通量"), prop.get("下り・車種判別不能交通量")
-                ]))
-                total = int((up or 0) + (down or 0))
-                pts.append({"position":[float(lon), float(lat)], "up": int(up or 0), "down": int(down or 0), "total": total})
+                pts.append({
+                    "position":[float(lon), float(lat)],
+                    "up": up, "down": down, "total": total,
+                    # ▼ ツールチップに出すフィールド（点・線で共通）
+                    "jt_time": tlabel,
+                    "jt_total": total,
+                    "jt_up": up,
+                    "jt_down": down,
+                })
     return pts
 
 def color_from_total(total:int) -> List[int]:
@@ -428,11 +445,10 @@ def color_from_total(total:int) -> List[int]:
     return [r,g,b, 230]
 
 def size_from_total(total:int) -> int:
-    # ★ サイズ拡大：最低48px、交通量に応じて大きく
     return 48 + int(min(260, total * 0.9))
 
 # ----------------------------------------------------------------------------
-# OSM (Overpass) 主要道路 & スナップ線（赤、ピクセル幅、フェールセーフ）
+# OSM（Overpass）＆擬似渋滞線（赤）
 # ----------------------------------------------------------------------------
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
@@ -480,7 +496,6 @@ def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]],
     out: List[Dict] = []
     if not j_points:
         return out
-    # 共通の赤（“渋滞線”風）
     RED = [230, 0, 0, 235]
 
     for jp in j_points:
@@ -504,20 +519,29 @@ def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]],
             p1 = [proj[0] - dx_deg, proj[1] - dy_deg]
             p2 = [proj[0] + dx_deg, proj[1] + dy_deg]
         else:
-            # ★ フェールセーフ：道路が無い/遠い場合は点の周りに短い東西線を描く
-            kx = 111320 * math.cos(math.radians(lat)); ky = 110540
+            # フェールセーフ：道路が無い/遠い場合は点の東西短線
+            kx = 111320 * math.cos(math.radians(lat))
             half = length_m / 2.0
             dx_deg = (half) / kx
             p1 = [lon - dx_deg, lat]
             p2 = [lon + dx_deg, lat]
 
-        width_px = 5 + min(12, jp["total"] // 100)  # 交通量に応じて少し太く
-        out.append({"path":[p1, p2], "color": RED, "width": width_px, "meta": jp})
+        width_px = 5 + min(12, (jp.get("total", 0)) // 100)
+        out.append({
+            "path": [p1, p2],
+            "color": RED,
+            "width": width_px,
+            # ▼ ツールチップに出すフィールド（線でも同じ表示）
+            "jt_time": jp.get("jt_time"),
+            "jt_total": jp.get("jt_total"),
+            "jt_up": jp.get("jt_up"),
+            "jt_down": jp.get("jt_down"),
+        })
 
     return out
 
 # ----------------------------------------------------------------------------
-# Builders（地図・交差点・速報など）
+# 各種ビルダー
 # ----------------------------------------------------------------------------
 def build_base_layers(map_choice:str, custom_tile:str) -> List[pdk.Layer]:
     tile = TILESETS.get(map_choice, TILESETS["標準"])
@@ -621,7 +645,7 @@ def build_points_labels_buffers(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict
     return points, icon_fg, mini_fg, mini_bg, geojson
 
 # ----------------------------------------------------------------------------
-# Pipeline（速報）
+# パイプライン（速報→位置推定）
 # ----------------------------------------------------------------------------
 with st.spinner("速報を取得中…"):
     html = fetch_ehime_html()
@@ -638,7 +662,7 @@ idx = GazetteerIndex(gdf) if gdf is not None else None
 def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
     return None if not idx else idx.search(name, min_score)
 
-def nominatim_or_center(ex: Dict) -> Dict:
+def resolve_loc(ex: Dict) -> Dict:
     muni = ex.get("municipality"); places = ex.get("place_strings") or []
     full_text = ex.get("full_text", "")
     llm_cands = gemini_candidates(full_text, muni)
@@ -657,7 +681,7 @@ def nominatim_or_center(ex: Dict) -> Dict:
     return {"lon":EHIME_PREF_LON, "lat":EHIME_PREF_LAT, "type":"pref"}
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exctr:
-    results = list(exctr.map(nominatim_or_center, extracted))
+    results = list(exctr.map(resolve_loc, extracted))
 
 rows: List[Dict] = []
 for ex, loc in zip(extracted, results):
@@ -716,7 +740,7 @@ with st.sidebar:
                                                       value=bool(st.session_state.show_jartic_points))
     st.session_state.show_snap_lines   = st.checkbox("JARTIC 5分値（線：OSMスナップ）",
                                                       value=bool(st.session_state.show_snap_lines))
-    st.caption("公開API / 約20分遅延。点=断面交通量、線=近傍道路へ擬似スナップ（赤の“渋滞線”）。")
+    st.caption("公開API / 約20分遅延。点=断面交通量、線=近傍道路へ擬似スナップ（赤い“渋滞線”）。")
 
     st.markdown("#### 危ない交差点")
     st.session_state.show_hotspots = st.checkbox("ヒートマップ / 3D柱 を表示",
@@ -759,15 +783,20 @@ with col_map:
     # --- JARTIC 5分値（点/線） ---
     j_points: List[Dict] = []; roads: List[List[List[float]]] = []
     if st.session_state.show_jartic_points or st.session_state.show_snap_lines:
-        gj = fetch_jartic_5min(EHIME_BBOX)
-        if gj: j_points = jartic_features_to_points(gj)
+        gj, tlabel = fetch_jartic_5min(EHIME_BBOX)
+        if gj and tlabel:
+            j_points = jartic_features_to_points(gj, tlabel)
 
     if st.session_state.show_jartic_points and j_points:
         pts_vis = [{
             "position": p["position"],
             "color": color_from_total(p["total"]),
             "radius": size_from_total(p["total"]),
-            "tooltip": f"合計:{p['total']}台/5分 上:{p['up']} 下:{p['down']}"
+            # ▼ ツールチップ用
+            "jt_time": p["jt_time"],
+            "jt_total": p["jt_total"],
+            "jt_up": p["jt_up"],
+            "jt_down": p["jt_down"],
         } for p in j_points]
         layers.append(
             pdk.Layer(
@@ -777,24 +806,31 @@ with col_map:
             )
         )
 
-    if st.session_state.show_snap_lines:
+    if st.session_state.show_snap_lines and j_points:
         roads = fetch_osm_roads_overpass(EHIME_BBOX)
-        lines = build_snap_lines(j_points, roads) if j_points else []
+        lines = build_snap_lines(j_points, roads)
         if lines:
             layers.append(
                 pdk.Layer(
                     "PathLayer", id="jartic-5min-snaplines", data=lines,
                     get_path="path", get_color="color", get_width="width",
-                    width_scale=1, width_min_pixels=3, opacity=0.98, pickable=True,
-                    width_units="pixels"  # ★ ピクセル幅で常に見える太さに
+                    width_scale=1, width_min_pixels=3, width_units="pixels",
+                    opacity=0.98, pickable=True
                 )
             )
 
+    # ▼ ここで全レイヤ共通ツールチップを定義。
+    #   JARTICオブジェクトには jt_* が入っているため、以下が表示される。
+    #   それ以外のレイヤでは jt_* は空のまま（何も表示されない）。
     tooltip_html = (
         "<div style='min-width:240px'>"
         "<b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/>"
-        f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a><br/>"
-        "<small>JARTIC: 断面交通量（約20分遅延）。赤い線は近傍道路へ擬似スナップした“渋滞線”表示。</small>"
+        f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a>"
+        "<div style='margin:6px 0;border-top:1px solid #2b3a4d'></div>"
+        "<div><b>JARTIC（5分値）</b></div>"
+        "<div>時刻: {jt_time}</div>"
+        "<div>合計: {jt_total} 台/5分</div>"
+        "<div>上り: {jt_up} / 下り: {jt_down}</div>"
         "</div>"
     )
 
@@ -872,4 +908,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真 | JARTIC 5分値（点=量グラデ, 線=赤い擬似渋滞） | 交差点ヒート/柱 ON/OFF | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
+st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真 | JARTIC 5分値（点=量グラデ/ホバーに時刻・合計・上り・下り、線=赤い擬似渋滞） | 交差点ヒート/柱 ON/OFF | 県警速報＋交差点CSV。緊急時は110・119へ。")
