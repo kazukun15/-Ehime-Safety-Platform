@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.2
-# - 地図タイル選択が反映されない問題を修正（TileLayer にユニーク id を付与）
-# - HexagonLayer を削除／件数ホバーを廃止
-# - TomTom Flow/Incidents タイル追加（secrets からキー取得）
-# - 1枚タイル健診（診断）を同梱
-# - 既存の速報スクレイピング→ガゼッティア/Nominatim→概位置バッファ表示 ほかは維持
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.3 (full)
+# - TomTomキーの柔軟検出 get_tomtom_key()
+# - 地図タイル切替の反映（TileLayerにユニークid）
+# - ズームHUD表示 & マップ上スタイルHUD
+# - 既存機能維持（速報→位置推定、カテゴリ別可視化、ヒート/3D柱、TomTom Flow/Incidents、フィード）
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -20,18 +19,46 @@ import streamlit as st
 import pydeck as pdk
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
-import h3  # クラスタ→スパイダー展開に使用（HexagonLayer は不使用）
+import h3
 
-# === Gemini (任意) ===
+# === Gemini (optional) ===
 try:
     import google.generativeai as genai
     _HAS_GEMINI = True
 except Exception:
     _HAS_GEMINI = False
 
+# ----------------------------------------------------------------------------
+# Secrets helper
+# ----------------------------------------------------------------------------
+
+def get_tomtom_key() -> str:
+    """TOMTOM_API_KEY を複数の置き場所から柔軟に探索して取得。
+    優先: st.secrets[top] → st.secrets["tomtom"]["API_KEY"] → st.secrets["gemini"]["TOMTOM_API_KEY"]
+          → env(TOMTOM_API_KEY)
+    """
+    try:
+        if "TOMTOM_API_KEY" in st.secrets and st.secrets["TOMTOM_API_KEY"]:
+            return st.secrets["TOMTOM_API_KEY"]
+    except Exception:
+        pass
+    for path in [("tomtom","API_KEY"),("TOMTOM","API_KEY"),("gemini","TOMTOM_API_KEY")]:
+        try:
+            d = st.secrets
+            for p in path:
+                d = d[p]
+            if d:
+                return d
+        except Exception:
+            continue
+    return os.getenv("TOMTOM_API_KEY", "")
+
+# ----------------------------------------------------------------------------
+# Consts / Theme
+# ----------------------------------------------------------------------------
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.2 (tile-id-fix, tomtom)"
+USER_AGENT = "ESP/9.3 (hud, tile-id-fix, tomtom)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -45,12 +72,19 @@ FANOUT_THRESHOLD = 4
 LABEL_SCALE = 1.0
 MAX_LABELS = 400
 
+CATEGORY_PATTERNS = [
+    ("交通事故", r"交通.*事故|自転車|バス|二輪|乗用|衝突|交差点|国道|県道|人身事故"),
+    ("火災",     r"火災|出火|全焼|半焼|延焼"),
+    ("死亡事案", r"死亡|死亡事案"),
+    ("窃盗",     r"窃盗|万引|盗"),
+    ("詐欺",     r"詐欺|還付金|投資詐欺|特殊詐欺"),
+    ("事件",     r"威力業務妨害|条例違反|暴行|傷害|脅迫|器物損壊|青少年保護"),
+]
 CITY_NAMES = [
     "松山市","今治市","新居浜市","西条市","大洲市","伊予市","四国中央市",
     "西予市","東温市","上島町","久万高原町","松前町","砥部町","内子町",
     "伊方町","松野町","鬼北町","愛南町","宇和島市","八幡浜市"
 ]
-
 MUNI_CENTERS = {
     "松山市":(132.7650,33.8390),"今治市":(133.0000,34.0660),"新居浜市":(133.2830,33.9600),
     "西条市":(133.1830,33.9180),"大洲市":(132.5500,33.5000),"伊予市":(132.7010,33.7550),
@@ -61,16 +95,9 @@ MUNI_CENTERS = {
     "宇和島市":(132.5600,33.2230),"八幡浜市":(132.4230,33.4620),
 }
 
-CATEGORY_PATTERNS = [
-    ("交通事故", r"交通.*事故|自転車|バス|二輪|乗用|衝突|交差点|国道|県道|人身事故"),
-    ("火災",     r"火災|出火|全焼|半焼|延焼"),
-    ("死亡事案", r"死亡|死亡事案"),
-    ("窃盗",     r"窃盗|万引|盗"),
-    ("詐欺",     r"詐欺|還付金|投資詐欺|特殊詐欺"),
-    ("事件",     r"威力業務妨害|条例違反|暴行|傷害|脅迫|器物損壊|青少年保護"),
-]
-
-# ===== UIテーマ =====
+# ----------------------------------------------------------------------------
+# Streamlit page/theme
+# ----------------------------------------------------------------------------
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 st.markdown(
     """
@@ -90,49 +117,46 @@ st.markdown(
       .feed-scroll {max-height:62vh; overflow-y:auto; padding-right:6px}
       @media (max-width: 640px){ .feed-scroll{max-height:48vh} }
       a { color: var(--a); }
-      .riskbar{height:10px; border-radius:6px; background:linear-gradient(90deg,#ffd4d4,#ff6b6b,#d90429);}
+      .riskbar{height:10px; border-radius:6px; background:linear-gradient(90deg,#ffd4d4,#ff6b6b,#d90429);}      
       .risklbl{display:flex; justify-content:space-between; font-size:.85rem; color:var(--muted); margin-top:4px}
+      .hud { position: relative; height:0; }
+      .hud-inner { position: relative; top:-36px; left:6px; display:flex; gap:6px; flex-wrap:wrap; }
+      .hud .btn, .hud .badge { background:rgba(16,20,27,.88); color:#e8f1ff; border:1px solid var(--border); padding:4px 8px; border-radius:10px; font-size:.85rem; }
+      .hud .btn { cursor:pointer; }
+      .hud .btn:hover { filter:brightness(1.1); }
+      @media (prefers-color-scheme: light){ .hud .btn, .hud .badge{ background:rgba(255,255,255,.9); color:#0f2230; } }
     </style>
     """,
     unsafe_allow_html=True,
 )
 st.markdown(
     f"""
-    <div class="topbar">
-      <div class="brand">
-        <div class="id">ES</div>
-        <div>
-          <div>{APP_TITLE}</div>
-          <div class="subnote">今に強い・先を読む。地図で一目、要点は簡潔。</div>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True
+    <div class=\"topbar\">\n      <div class=\"brand\">\n        <div class=\"id\">ES</div>\n        <div>\n          <div>{APP_TITLE}</div>\n          <div class=\"subnote\">今に強い・先を読む。地図で一目、要点は簡潔。</div>\n        </div>\n      </div>\n    </div>\n    """,
+    unsafe_allow_html=True,
 )
 
-# ===== Sidebar =====
+# ----------------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------------
+if "map_choice" not in st.session_state:
+    st.session_state.map_choice = "GSI 淡色"
+
 with st.sidebar:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.markdown("#### 表示期間")
     period = st.select_slider("表示期間を選択", ["当日","過去3日","過去7日","過去30日"], value="過去7日", label_visibility="collapsed")
-    period_days = {"当日":1, "過去3日":3, "過去7日":7, "過去30日":30}[period]
 
     st.markdown("#### 地図タイル")
-    map_choice = st.selectbox(
-        "地図スタイル",
-        ["GSI 淡色","GSI 標準","OpenStreetMap Standard","OSM Humanitarian","OpenTopoMap"],
-        index=0
-    )
+    map_options = ["GSI 淡色","GSI 標準","OpenStreetMap Standard","OSM Humanitarian","OpenTopoMap"]
+    map_choice = st.selectbox("地図スタイル", map_options, index=map_options.index(st.session_state.map_choice))
+    st.session_state.map_choice = map_choice
 
     st.markdown("#### 表示モード")
     mode_3d = st.radio("2D / 3D", ["2D","3D"], horizontal=True, index=0)
+    init_zoom = st.slider("初期ズーム", 8, 17, 11)
 
     st.markdown("#### TomTom 渋滞表示")
-    tomtom_style = st.selectbox(
-        "Flow スタイル",
-        ["relative0", "relative1", "absolute", "relative0-dark", "absolute-dark"],
-        index=0
-    )
+    tomtom_style = st.selectbox("Flow スタイル", ["relative0","relative1","absolute","relative0-dark","absolute-dark"], index=0)
     show_tomtom_flow = st.checkbox("TomTom Flow を重ねる", value=False)
     show_tomtom_inc  = st.checkbox("TomTom Incidents を重ねる", value=False)
     tomtom_opacity   = st.slider("TomTom タイル不透明度", 0.0, 1.0, 0.75, 0.05)
@@ -142,7 +166,9 @@ with st.sidebar:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-# ===== SQLite cache =====
+# ----------------------------------------------------------------------------
+# SQLite cache (for LLM etc.)
+# ----------------------------------------------------------------------------
 @st.cache_resource
 def get_sqlite():
     os.makedirs("data", exist_ok=True)
@@ -162,7 +188,10 @@ def cache_put(table:str, key:str, payload:str):
     with conn_lock, conn:
         conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,datetime('now'))", (key, payload))
 
-# ===== Helpers =====
+# ----------------------------------------------------------------------------
+# Utilities
+# ----------------------------------------------------------------------------
+
 def _norm(s: str) -> str:
     s = unicodedata.normalize('NFKC', s or '').strip()
     s = re.sub(r"\s+", " ", s)
@@ -174,7 +203,9 @@ class IncidentItem:
     body: str
     incident_date: Optional[str]
 
-# ===== Fetch & Parse =====
+# ----------------------------------------------------------------------------
+# Fetch & Parse Ehime Police page
+# ----------------------------------------------------------------------------
 @st.cache_data(ttl=TTL_HTML)
 def fetch_ehime_html() -> str:
     headers = {"User-Agent": USER_AGENT}
@@ -227,11 +258,15 @@ def parse_items(html: str) -> List[IncidentItem]:
             try:
                 dt = datetime(y, mm, dd).date();  y -= 1 if dt > today else 0
                 d = datetime(y, mm, dd).date().isoformat()
-            except: d = None
+            except Exception:
+                d = None
         out.append(IncidentItem(h.replace("■", "").strip(), body, d))
     return out
 
-# ===== 軽量ルール抽出 =====
+# ----------------------------------------------------------------------------
+# Rule-based extraction
+# ----------------------------------------------------------------------------
+
 def rule_extract(it: IncidentItem) -> Dict:
     t = it.heading + " " + it.body
     cat = "その他"
@@ -250,7 +285,9 @@ def rule_extract(it: IncidentItem) -> Dict:
     return {"category":cat,"municipality":muni,"place_strings":list(dict.fromkeys(places))[:3],
             "summary": s or it.heading, "date": it.incident_date}
 
-# ===== Gazetteer（外部CSVは任意） =====
+# ----------------------------------------------------------------------------
+# Gazetteer (optional external CSV)
+# ----------------------------------------------------------------------------
 @st.cache_resource
 def load_gazetteer(path:str) -> Optional[pd.DataFrame]:
     try:
@@ -275,7 +312,10 @@ class GazetteerIndex:
             r = self.df.iloc[hit[2]]; return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
         return None
 
-# ===== Nominatim =====
+# ----------------------------------------------------------------------------
+# Nominatim fallback
+# ----------------------------------------------------------------------------
+
 def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[float,float]]:
     try:
         q = f"{name} {municipality or ''} 愛媛県 日本".strip()
@@ -288,14 +328,26 @@ def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[fl
             r.raise_for_status()
             arr = r.json()
             if isinstance(arr, list) and arr:
-                return float(arr[0]["lon"]), float(arr[0]["lat"])
+                return float(arr[0]["lon"]), float(arr[0]["lat"])  # lon, lat
         return None
     except Exception:
         return None
 
-# ===== Gemini 解析（任意） =====
+# ----------------------------------------------------------------------------
+# Gemini extraction (optional)
+# ----------------------------------------------------------------------------
+
+def _read_gemini_key() -> str:
+    # st.secrets[["gemini"]["API_KEY"]] or env GEMINI_API_KEY
+    try:
+        if "gemini" in st.secrets and "API_KEY" in st.secrets["gemini"]:
+            return st.secrets["gemini"]["API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "")
+
 def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
-    api_key = os.getenv("GEMINI_API_KEY", "")
+    api_key = _read_gemini_key()
     if not (_HAS_GEMINI and api_key):
         return []
     key_src = f"gem9|{muni_hint or ''}|{full_text}"
@@ -331,13 +383,18 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
         return []
     return []
 
-# ===== H3/Cluster for spiderfy =====
+# ----------------------------------------------------------------------------
+# H3 helpers & clustering
+# ----------------------------------------------------------------------------
+
 def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
-    if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)  # v3
+    if hasattr(h3, "geo_to_h3"):
+        return h3.geo_to_h3(lat, lon, res)  # v3
     return h3.latlng_to_cell(lat, lon, res)  # v4
 
 def h3_latlng_from_cell(cell: str) -> Tuple[float,float]:
-    if hasattr(h3, "h3_to_geo"): lat, lon = h3.h3_to_geo(cell); return lat, lon  # v3
+    if hasattr(h3, "h3_to_geo"):
+        lat, lon = h3.h3_to_geo(cell); return lat, lon  # v3
     lat, lon = h3.cell_to_latlng(cell); return lat, lon  # v4
 
 def h3_res_from_zoom(zoom_val:int) -> int:
@@ -357,7 +414,10 @@ def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
         centers.append({"cell":cell, "lon":lon, "lat":lat, "count":len(rows), "rows":rows})
     return centers
 
-# ===== 表示テキスト =====
+# ----------------------------------------------------------------------------
+# Presentation helpers
+# ----------------------------------------------------------------------------
+
 def short_summary(s: str, max_len: int = 64) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
     return (s[:max_len] + ("…" if len(s) > max_len else "")) if s else ""
@@ -371,7 +431,9 @@ def make_prediction(category:str, muni:Optional[str]) -> str:
     if category == "死亡事案":   return "詳細は出典で確認。周辺では救急活動に配慮。"
     return "同種事案が続く可能性。出典で最新を確認。"
 
-# ===== パイプライン =====
+# ----------------------------------------------------------------------------
+# Pipeline
+# ----------------------------------------------------------------------------
 with st.spinner("速報を取得中…"):
     html = fetch_ehime_html()
 raw_items = parse_items(html)
@@ -383,7 +445,7 @@ for it in raw_items:
     ex["full_text"] = (it.heading + " " + it.body).strip()
     extracted.append(ex)
 
-# Gazetteer（任意）
+# Gazetteer（任意CSV）
 gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
@@ -428,9 +490,12 @@ for ex, loc in zip(extracted, results):
         "pred": make_prediction(ex["category"], ex.get("municipality")),
         "src": EHIME_POLICE_URL,
     })
+
 df = pd.DataFrame(rows)
 
-# ===== 事故多発交差点 CSV（内蔵） =====
+# ----------------------------------------------------------------------------
+# 多発交差点 CSV（内蔵）
+# ----------------------------------------------------------------------------
 CSV_TEXT = """地点名,緯度,経度,年間最多事故件数,補足
 天山交差点,33.8223,132.7758,6,松山市天山町付近（2023年に6件事故）
 和泉交差点,33.8216,132.7554,5,松山市和泉町付近（2023年に5件事故）
@@ -466,9 +531,11 @@ def color_from_count(c:int) -> List[int]:
     return [r,g,b,alpha]
 
 hot_df["rgba"] = hot_df["count"].apply(color_from_count)
-hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)  # 3D柱の高さ
+hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)
 
-# ===== カテゴリ色／アイコン =====
+# ----------------------------------------------------------------------------
+# Category styles
+# ----------------------------------------------------------------------------
 CAT_STYLE = {
     "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
     "火災":     {"color":[245, 130, 50, 235],  "radius":88, "icon":"🔥"},
@@ -479,7 +546,9 @@ CAT_STYLE = {
     "その他":   {"color":[128, 144, 160, 220], "radius":70, "icon":"・"},
 }
 
-# ===== 可視化データ（クラスタ→スパイダー展開） =====
+# ----------------------------------------------------------------------------
+# Cluster → spiderfy → points & labels & buffers
+# ----------------------------------------------------------------------------
 vis_df = df
 centers = cluster_points(vis_df, ZOOM_LIKE) if not vis_df.empty else []
 
@@ -496,7 +565,6 @@ points: List[Dict] = []
 icon_labels: List[Dict] = []
 mini_labels_fg: List[Dict] = []
 mini_labels_bg: List[Dict] = []
-polys: List[Dict] = []
 
 for c in centers:
     cnt = c["count"]; clat, clon = c["lat"], c["lon"]
@@ -514,15 +582,15 @@ for c in centers:
             icon_labels.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
             if len(mini_labels_fg) < MAX_LABELS:
                 vtxt = (row["summary"] or "")[:4]
-                vtxt = "\n".join(list(vtxt))  # 縦並び
+                vtxt = "\n".join(list(vtxt))
                 offset_px = int(-14*LABEL_SCALE)
                 mini_labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
                 mini_labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
-            polys.append({"lon":lon,"lat":lat,"r":int(row.get("radius_m",600))})
     else:
-        # 集中箇所の簡易表示（件数テキストは表示しない）
         points.append({"position":[clon,clat],"color":[100,100,100,210],"radius":70,"c":"集中","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎"})
         icon_labels.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
+
+# buffer polygons (approximate circles)
 
 def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
     coords = []
@@ -534,19 +602,27 @@ def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
         lat_i = lat + math.degrees(dlat * math.sin(ang))
         lon_i = lon + math.degrees(dlon * math.cos(math.radians(lat)))
         coords.append([lon_i, lat_i])
-    coords.append(coords[0]); return coords
+    coords.append(coords[0])
+    return coords
 
 geo_features = []
 for p in points:
     if p.get("r",0) > 0:
-        geo_features.append({"type":"Feature","geometry":{"type":"Polygon","coordinates":[circle_coords(p["position"][0], p["position"][1], int(p["r"]))]},"properties":{}})
+        lon, lat = p["position"][0], p["position"][1]
+        geo_features.append({
+            "type":"Feature",
+            "geometry":{"type":"Polygon","coordinates":[circle_coords(lon, lat, int(p["r"]))]},
+            "properties":{}
+        })
 geojson = {"type":"FeatureCollection","features": geo_features}
 
-# ===== レイアウト =====
+# ----------------------------------------------------------------------------
+# Layout
+# ----------------------------------------------------------------------------
 col_map, col_feed = st.columns([7,5], gap="large")
 
 with col_map:
-    # ベースタイル
+    # basemap tiles
     TILESETS = {
         "GSI 淡色": {"url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", "max_zoom": 18},
         "GSI 標準": {"url": "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", "max_zoom": 18},
@@ -554,11 +630,12 @@ with col_map:
         "OSM Humanitarian": {"url": "https://tile-a.openstreetmap.fr/hot/{z}/{x}/{y}.png", "max_zoom": 19},
         "OpenTopoMap": {"url": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png", "max_zoom": 17},
     }
+    map_choice = st.session_state.map_choice
     TILE = TILESETS.get(map_choice, TILESETS["GSI 淡色"])
     is_3d = (mode_3d == "3D")
 
-    # 交差点ホットスポット
-    intersection_layers = []
+    # intersections: heat or columns
+    intersection_layers: List[pdk.Layer] = []
     if not hot_df.empty:
         if is_3d:
             intersection_layers.append(
@@ -587,11 +664,11 @@ with col_map:
                     intensity=0.85,
                     threshold=0.05,
                     opacity=0.35,
-                    pickable=False
+                    pickable=False,
                 )
             )
 
-    # 推定渋滞（事故密度）—視覚のみ
+    # light congestion grid (from accidents)
     congestion_layer = None
     if (not df.empty) and (not is_3d):
         acc = df[df["category"] == "交通事故"].copy()
@@ -619,10 +696,8 @@ with col_map:
                 ],
             )
 
-    # ===== レイヤ構成（ユニーク id を付けて選択反映を保証） =====
+    # build layers with unique ids
     layers: List[pdk.Layer] = []
-
-    # ベース地図（id を map_choice に依存させる）
     layers.append(
         pdk.Layer(
             "TileLayer",
@@ -636,7 +711,6 @@ with col_map:
         )
     )
 
-    # 任意タイル
     if custom_tile.strip():
         layers.append(
             pdk.Layer(
@@ -651,8 +725,7 @@ with col_map:
             )
         )
 
-    # TomTom Flow / Incidents（secrets）
-    tomtom_key = st.secrets.get("TOMTOM_API_KEY", "") or os.getenv("TOMTOM_API_KEY", "")
+    tomtom_key = get_tomtom_key()
     if show_tomtom_flow and tomtom_key:
         flow_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{tomtom_style}/{{z}}/{{x}}/{{y}}.png?key={tomtom_key}"
         layers.append(
@@ -682,13 +755,12 @@ with col_map:
             )
         )
 
-    # 交差点／推定渋滞
     for L in intersection_layers:
         layers.append(L)
     if congestion_layer is not None:
         layers.append(congestion_layer)
 
-    # 概位置・ポイント・ラベル・円
+    # points / labels / buffers
     layers += [
         pdk.Layer("GeoJsonLayer", id="approx-buffers", data=geojson, pickable=False, stroked=True, filled=True,
                   get_line_width=2, get_line_color=[0,160,220], get_fill_color=[0,160,220,40], auto_highlight=False),
@@ -702,15 +774,15 @@ with col_map:
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
 
-    # ツールチップ（件数テキストは載せない）
-    tooltip_html = """
-    <div style='min-width:180px'>
-      <b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/><a href='{src}' target='_blank'>出典</a>
-    </div>
-    """
+    tooltip_html = (
+        "<div style='min-width:180px'>"
+        "<b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/>"
+        f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a>"
+        "</div>"
+    )
     deck = pdk.Deck(
         layers=layers,
-        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=11, pitch=(45 if is_3d else 0), bearing=0),
+        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=init_zoom, pitch=(45 if is_3d else 0), bearing=0),
         tooltip={
             "html": tooltip_html,
             "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"320px","whiteSpace":"normal",
@@ -721,23 +793,38 @@ with col_map:
     )
     st.pydeck_chart(deck, use_container_width=True, height=620)
 
-    # ===== TomTom タイル健診（診断・任意） =====
+    # ---- HUD on map (zoom & style buttons) ----
+    st.markdown("<div class='hud'><div class='hud-inner'>", unsafe_allow_html=True)
+    c1, c2 = st.columns([1,6])
+    with c1:
+        st.markdown(f"<div class='badge'>Zoom: {init_zoom}（初期）</div>", unsafe_allow_html=True)
+    with c2:
+        with st.form("style-hud", clear_on_submit=False):
+            cols = st.columns(5)
+            names = ["GSI 淡色","GSI 標準","OpenStreetMap Standard","OSM Humanitarian","OpenTopoMap"]
+            for i, name in enumerate(names):
+                with cols[i]:
+                    if st.form_submit_button(name, use_container_width=True):
+                        st.session_state.map_choice = name
+                        st.rerun()
+        st.caption("上のボタンで地図スタイルを即切替できます（モバイル対応）。")
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+    # ---- TomTom tile self-check ----
     with st.expander("TomTom タイル健診（表示されない時の診断）", expanded=False):
         if tomtom_key:
             z = 14
-            import math
             lat, lon = EHIME_PREF_LAT, EHIME_PREF_LON
             n = 2.0 ** z
             xtile = int((lon + 180.0) / 360.0 * n)
             lat_rad = math.radians(lat)
             ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-
             test_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{tomtom_style}/{z}/{xtile}/{ytile}.png?key={tomtom_key}"
             st.code(test_url, language="text")
             try:
                 rr = requests.get(test_url, timeout=8)
                 st.write("HTTP:", rr.status_code)
-                if rr.ok and rr.headers.get("content-type","").startswith("image/"):
+                if rr.ok and rr.headers.get("content-type","{}").startswith("image/"):
                     st.image(rr.content, caption="Flow タイル 1枚テスト（ズーム14, 松山付近）")
                 else:
                     st.warning("画像が返っていません。Referer制限 / スタイル名 / キー権限を確認してください。")
@@ -746,14 +833,16 @@ with col_map:
         else:
             st.info("TOMTOM_API_KEY が未設定です。secrets に設定してください。")
 
-    # 凡例
+    # legend
     legend_items = []
     for k, v in CAT_STYLE.items():
         rgba = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{rgba}'></span>{k}</span>")
-    legend_html = f"<div class='legend'>{''.join(legend_items)}" \
-                  f"<div style='margin-top:10px'><div class='riskbar'></div>" \
-                  f"<div class='risklbl'><span>交差点リスク（低）</span><span>高：最大 {max_count}件/年</span></div></div></div>"
+    legend_html = (
+        f"<div class='legend'>{''.join(legend_items)}"
+        f"<div style='margin-top:10px'><div class='riskbar'></div>"
+        f"<div class='risklbl'><span>交差点リスク（低）</span><span>高：最大 {max_count}件/年</span></div></div></div>"
+    )
     st.markdown(legend_html, unsafe_allow_html=True)
 
 with col_feed:
