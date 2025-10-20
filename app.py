@@ -1,13 +1,11 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.5 (refactor)
-# 目的：機能を保持しつつ徹底的にDRY化。重複排除・関数化・定数集約・命名統一。
-# 主要変更点：
-# - レイヤ構築処理を build_base_layers()/build_overlay_layers()/build_intersection_layers()/build_congestion_grid()/build_points_labels_buffers() に分割
-# - Google Maps風レイヤピッカー（右下FAB）は render_layer_picker() に集約
-# - TomTomタイルの生成/診断を tomtom_tile_url()/render_tomtom_selfcheck() に集約
-# - 交差点ヒート/3D柱・事故グリッド・ポイント/ラベル/バッファ生成を各小関数に分割
-# - 各種定数・スタイル・カテゴリ辞書・タイル定義を一元化
-# - バグ修正：hot_df["position"] のカッコ不整合を修正
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.4 (handover)
+# 変更点（v9.3→v9.4）
+# - Google Maps風のマップ選択UI（右下レイヤーボタン→サムネ付ポップオーバー）
+# - TileLayerはユニークID維持（ベース/オーバーレイごと）
+# - サイドバーの「地図スタイル」選択は廃止 → HUDのみ（Google Maps参照UI）
+# - TomTom Flow/IncidentsトグルをHUD側にも複製（利便性向上）
+# - その他の既存機能は維持（速報→位置推定、カテゴリ別可視化、ヒート/3D柱、フィード）
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -33,11 +31,35 @@ except Exception:
     _HAS_GEMINI = False
 
 # ----------------------------------------------------------------------------
-# Config / Constants
+# Secrets helper
+# ----------------------------------------------------------------------------
+
+def get_tomtom_key() -> str:
+    """TOMTOM_API_KEY の柔軟検出。
+    優先: st.secrets[top] → st.secrets["tomtom"]["API_KEY"] → st.secrets["gemini"]["TOMTOM_API_KEY"] → env
+    """
+    try:
+        if "TOMTOM_API_KEY" in st.secrets and st.secrets["TOMTOM_API_KEY"]:
+            return st.secrets["TOMTOM_API_KEY"]
+    except Exception:
+        pass
+    for path in [("tomtom","API_KEY"),("TOMTOM","API_KEY"),("gemini","TOMTOM_API_KEY")]:
+        try:
+            d = st.secrets
+            for p in path:
+                d = d[p]
+            if d:
+                return d
+        except Exception:
+            continue
+    return os.getenv("TOMTOM_API_KEY", "")
+
+# ----------------------------------------------------------------------------
+# Consts / Theme
 # ----------------------------------------------------------------------------
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.5 (refactor, gmaps-picker, tomtom)"
+USER_AGENT = "ESP/9.4 (gmaps-like-picker, hud, tile-id-fix, tomtom)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -59,13 +81,11 @@ CATEGORY_PATTERNS = [
     ("詐欺",     r"詐欺|還付金|投資詐欺|特殊詐欺"),
     ("事件",     r"威力業務妨害|条例違反|暴行|傷害|脅迫|器物損壊|青少年保護"),
 ]
-
 CITY_NAMES = [
     "松山市","今治市","新居浜市","西条市","大洲市","伊予市","四国中央市",
     "西予市","東温市","上島町","久万高原町","松前町","砥部町","内子町",
     "伊方町","松野町","鬼北町","愛南町","宇和島市","八幡浜市"
 ]
-
 MUNI_CENTERS = {
     "松山市":(132.7650,33.8390),"今治市":(133.0000,34.0660),"新居浜市":(133.2830,33.9600),
     "西条市":(133.1830,33.9180),"大洲市":(132.5500,33.5000),"伊予市":(132.7010,33.7550),
@@ -76,64 +96,64 @@ MUNI_CENTERS = {
     "宇和島市":(132.5600,33.2230),"八幡浜市":(132.4230,33.4620),
 }
 
-# タイル定義（Google Mapsの地図/地形/航空写真に相当 + Humanitarian）
-TILESETS: Dict[str, Dict] = {
-    "標準":     {"url":"https://tile.openstreetmap.org/{z}/{x}/{y}.png", "max_zoom":19, "thumb":"https://tile.openstreetmap.org/14/14553/6620.png", "copyright":"© OpenStreetMap"},
-    "淡色":     {"url":"https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", "max_zoom":18, "thumb":"https://cyberjapandata.gsi.go.jp/xyz/pale/14/14553/6620.png", "copyright":"© GSI"},
-    "地形":     {"url":"https://a.tile.opentopomap.org/{z}/{x}/{y}.png", "max_zoom":17, "thumb":"https://a.tile.opentopomap.org/14/14553/6620.png", "copyright":"© OpenTopoMap"},
-    "人道支援": {"url":"https://tile-a.openstreetmap.fr/hot/{z}/{x}/{y}.png", "max_zoom":19, "thumb":"https://tile-a.openstreetmap.fr/hot/14/14553/6620.png", "copyright":"© HOT OSM"},
-    "航空写真": {"url":"https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg", "max_zoom":18, "thumb":"https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/14/14553/6620.jpg", "copyright":"© GSI"},
-}
-
 # ----------------------------------------------------------------------------
-# Streamlit base UI
+# Streamlit page/theme
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 
 st.markdown(
-    f"""
+    """
     <style>
-      :root{{ --bg:#0b0f14; --panel:#0f141b; --panel2:#121924; --text:#e8f1ff; --muted:#8aa0b6; --border:#2b3a4d; --a:#007aff; --b:#00b894; }}
-      @media (prefers-color-scheme: light){{ :root{{ --bg:#f7fafc; --panel:#ffffff; --panel2:#f1f5f9; --text:#0f2230; --muted:#586b7a; --border:#dfe7ef; --a:#005acb; --b:#009a7a; }} }}
-      html, body, .stApp {{ background: var(--bg); color: var(--text); }}
-      .topbar{{ position: sticky; top:0; z-index:10; padding:14px 16px; margin:-16px -16px 14px -16px; border-bottom:1px solid var(--border); background:var(--panel); }}
-      .brand{{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:1.05rem; }}
-      .brand .id{{ width:28px; height:28px; border-radius:8px; display:grid; place-items:center; background: linear-gradient(135deg,var(--a),var(--b)); color:#00131a; font-weight:900; }}
-      .subnote{{ color: var(--muted); font-size:.85rem; margin-top:4px}}
-      .panel {{ background: var(--panel); border:1px solid var(--border); border-radius: 14px; padding: 10px 12px; }}
-      .legend {{ font-size:.95rem; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 12px;}}
-      .legend .item {{ display:inline-flex; align-items:center; margin-right:14px; margin-bottom:6px}}
-      .dot {{ width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px; border:1px solid #0003}}
-      .feed-card {{background:var(--panel); padding:12px 14px; border-radius:14px; border:1px solid var(--border); margin-bottom:10px;}}
-      .feed-scroll {{max-height:62vh; overflow-y:auto; padding-right:6px}}
-      @media (max-width: 640px){{ .feed-scroll{{max-height:48vh}} }}
-      a {{ color: var(--a); }}
-      .riskbar{{height:10px; border-radius:6px; background:linear-gradient(90deg,#ffd4d4,#ff6b6b,#d90429);}}      
-      .risklbl{{display:flex; justify-content:space-between; font-size:.85rem; color:var(--muted); margin-top:4px}}
-      /* レイヤーピッカー */
-      .layers-fab {{ position:fixed; right:18px; bottom:18px; z-index:20; }}
-      .layers-fab .btn {{ width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:var(--panel); border:1px solid var(--border); box-shadow:0 6px 18px rgba(0,0,0,.22); cursor:pointer; }}
-      .layers-panel {{ width:min(92vw, 720px); background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:14px; padding:12px; box-shadow:0 10px 24px rgba(0,0,0,.28); }}
-      .grid {{ display:grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap:12px; }}
-      @media (max-width: 740px){{ .grid{{grid-template-columns: repeat(2, 1fr);} }}
-      .card {{ border:1px solid var(--border); border-radius:12px; overflow:hidden; background:var(--panel2); }}
-      .thumb {{ width:100%; aspect-ratio: 4/3; object-fit:cover; }}
-      .label {{ padding:8px 10px; font-size:.95rem; display:flex; align-items:center; justify-content:space-between; }}
-      .active {{ outline:2px solid var(--a); }}
-      .toggles {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; }}
-      .toggle {{ padding:6px 10px; border-radius:10px; border:1px solid var(--border); background:var(--panel2); }}
-      .hud {{ position: relative; height:0; }}
-      .hud-inner {{ position: relative; top:-36px; left:6px; display:flex; gap:6px; flex-wrap:wrap; }}
-      .hud .badge {{ background:rgba(16,20,27,.88); color:#e8f1ff; border:1px solid var(--border); padding:4px 8px; border-radius:10px; font-size:.85rem; }}
-      @media (prefers-color-scheme: light){{ .hud .badge{{ background:rgba(255,255,255,.9); color:#0f2230; }} }}
+      :root{ --bg:#0b0f14; --panel:#0f141b; --panel2:#121924; --text:#e8f1ff; --muted:#8aa0b6; --border:#2b3a4d; --a:#007aff; --b:#00b894; }
+      @media (prefers-color-scheme: light){ :root{ --bg:#f7fafc; --panel:#ffffff; --panel2:#f1f5f9; --text:#0f2230; --muted:#586b7a; --border:#dfe7ef; --a:#005acb; --b:#009a7a; } }
+      html, body, .stApp { background: var(--bg); color: var(--text); }
+      .topbar{ position: sticky; top:0; z-index:10; padding:14px 16px; margin:-16px -16px 14px -16px; border-bottom:1px solid var(--border); background:var(--panel); }
+      .brand{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:1.05rem; }
+      .brand .id{ width:28px; height:28px; border-radius:8px; display:grid; place-items:center; background: linear-gradient(135deg,var(--a),var(--b)); color:#00131a; font-weight:900; }
+      .subnote{ color: var(--muted); font-size:.85rem; margin-top:4px}
+      .panel { background: var(--panel); border:1px solid var(--border); border-radius: 14px; padding: 10px 12px; }
+      .legend { font-size:.95rem; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 12px;}
+      .legend .item { display:inline-flex; align-items:center; margin-right:14px; margin-bottom:6px}
+      .dot { width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px; border:1px solid #0003}
+      .feed-card {background:var(--panel); padding:12px 14px; border-radius:14px; border:1px solid var(--border); margin-bottom:10px;}
+      .feed-scroll {max-height:62vh; overflow-y:auto; padding-right:6px}
+      @media (max-width: 640px){ .feed-scroll{max-height:48vh} }
+      a { color: var(--a); }
+      .riskbar{height:10px; border-radius:6px; background:linear-gradient(90deg,#ffd4d4,#ff6b6b,#d90429);}      
+      .risklbl{display:flex; justify-content:space-between; font-size:.85rem; color:var(--muted); margin-top:4px}
+
+      /* ---- Google Maps風 レイヤーピッカー ---- */
+      .layers-fab { position:fixed; right:18px; bottom:18px; z-index:20; }
+      .layers-fab .btn { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:var(--panel); border:1px solid var(--border); box-shadow:0 6px 18px rgba(0,0,0,.22); cursor:pointer; }
+      .layers-fab .btn:hover{ filter:brightness(1.1); }
+      .layers-panel { width:min(92vw, 720px); background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:14px; padding:12px; box-shadow:0 10px 24px rgba(0,0,0,.28); }
+      .grid { display:grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap:12px; }
+      @media (max-width: 740px){ .grid{grid-template-columns: repeat(2, 1fr);} }
+      .card { border:1px solid var(--border); border-radius:12px; overflow:hidden; background:var(--panel2); }
+      .thumb { width:100%; aspect-ratio: 4/3; object-fit:cover; }
+      .label { padding:8px 10px; font-size:.95rem; display:flex; align-items:center; justify-content:space-between; }
+      .active { outline:2px solid var(--a); }
+      .toggles { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; }
+      .toggle { padding:6px 10px; border-radius:10px; border:1px solid var(--border); background:var(--panel2); }
+
+      /* HUD: 初期ズーム表示（簡素化） */
+      .hud { position: relative; height:0; }
+      .hud-inner { position: relative; top:-36px; left:6px; display:flex; gap:6px; flex-wrap:wrap; }
+      .hud .badge { background:rgba(16,20,27,.88); color:#e8f1ff; border:1px solid var(--border); padding:4px 8px; border-radius:10px; font-size:.85rem; }
+      @media (prefers-color-scheme: light){ .hud .badge{ background:rgba(255,255,255,.9); color:#0f2230; } }
     </style>
-    <div class=\"topbar\"><div class=\"brand\"><div class=\"id\">ES</div><div><div>{APP_TITLE}</div><div class=\"subnote\">今に強い・先を読む。地図で一目、要点は簡潔。</div></div></div></div>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    f"""
+    <div class=\"topbar\">\n  <div class=\"brand\">\n    <div class=\"id\">ES</div>\n    <div>\n      <div>{APP_TITLE}</div>\n      <div class=\"subnote\">今に強い・先を読む。地図で一目、要点は簡潔。</div>\n    </div>\n  </div>\n</div>\n    """,
+    unsafe_allow_html=True,
+)
+
 # ----------------------------------------------------------------------------
-# Session state (single source of truth)
+# 初期状態
 # ----------------------------------------------------------------------------
 if "map_choice" not in st.session_state:
     st.session_state.map_choice = "標準"
@@ -145,28 +165,30 @@ if "tomtom_style" not in st.session_state:
     st.session_state.tomtom_style = "relative0"
 
 # ----------------------------------------------------------------------------
-# Secrets helper
+# Sidebar（操作は最小限にし、地図選択はHUDに集約）
 # ----------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("<div class='panel'>", unsafe_allow_html=True)
+    st.markdown("#### 表示期間")
+    period = st.select_slider("表示期間を選択", ["当日","過去3日","過去7日","過去30日"], value="過去7日", label_visibility="collapsed")
 
-def get_tomtom_key() -> str:
-    try:
-        if "TOMTOM_API_KEY" in st.secrets and st.secrets["TOMTOM_API_KEY"]:
-            return st.secrets["TOMTOM_API_KEY"]
-    except Exception:
-        pass
-    for path in [("tomtom","API_KEY"),("TOMTOM","API_KEY"),("gemini","TOMTOM_API_KEY")]:
-        try:
-            d = st.secrets
-            for p in path:
-                d = d[p]
-            if d:
-                return d
-        except Exception:
-            continue
-    return os.getenv("TOMTOM_API_KEY", "")
+    st.markdown("#### 表示モード")
+    mode_3d = st.radio("2D / 3D", ["2D","3D"], horizontal=True, index=0)
+    init_zoom = st.slider("初期ズーム", 8, 17, 11)
+
+    st.markdown("#### TomTom 渋滞（詳細設定）")
+    st.session_state.tomtom_style = st.selectbox("Flow スタイル", ["relative0","relative1","absolute","relative0-dark","absolute-dark"], index=["relative0","relative1","absolute","relative0-dark","absolute-dark"].index(st.session_state.tomtom_style))
+    st.session_state.show_tomtom_flow = st.checkbox("TomTom Flow を重ねる", value=bool(st.session_state.show_tomtom_flow))
+    st.session_state.show_tomtom_inc  = st.checkbox("TomTom Incidents を重ねる", value=bool(st.session_state.show_tomtom_inc))
+    tomtom_opacity   = st.slider("TomTom タイル不透明度", 0.0, 1.0, 0.75, 0.05)
+
+    st.markdown("#### 任意タイルURL（透過PNG推奨）")
+    custom_tile = st.text_input("例: https://…/{z}/{x}/{y}.png", "")
+
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ----------------------------------------------------------------------------
-# Cache (SQLite)
+# SQLite cache (for LLM etc.)
 # ----------------------------------------------------------------------------
 @st.cache_resource
 def get_sqlite():
@@ -176,22 +198,26 @@ def get_sqlite():
         conn.execute("CREATE TABLE IF NOT EXISTS geocode_cache(key TEXT PRIMARY KEY, json TEXT, created_at TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS llm_cache(key TEXT PRIMARY KEY, json TEXT, created_at TEXT)")
     return conn
-
-_conn = get_sqlite()
-_conn_lock = threading.Lock()
+conn = get_sqlite(); conn_lock = threading.Lock()
 
 def cache_get(table:str, key:str) -> Optional[str]:
-    with _conn_lock:
-        row = _conn.execute(f"SELECT json FROM {table} WHERE key=?", (key,)).fetchone()
+    with conn_lock:
+        row = conn.execute(f"SELECT json FROM {table} WHERE key=?", (key,)).fetchone()
     return row[0] if row else None
 
 def cache_put(table:str, key:str, payload:str):
-    with _conn_lock, _conn:
-        _conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,datetime('now'))", (key, payload))
+    with conn_lock, conn:
+        conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,datetime('now'))", (key, payload))
 
 # ----------------------------------------------------------------------------
-# Data classes / parsing
+# Utilities / parsing
 # ----------------------------------------------------------------------------
+
+def _norm(s: str) -> str:
+    s = unicodedata.normalize('NFKC', s or '').strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
 @dataclass
 class IncidentItem:
     heading: str
@@ -256,22 +282,30 @@ def parse_items(html: str) -> List[IncidentItem]:
     return out
 
 # ----------------------------------------------------------------------------
-# Extraction / Gazetteer / Geocoding
+# Rule-based extraction
 # ----------------------------------------------------------------------------
 
 def rule_extract(it: IncidentItem) -> Dict:
     t = it.heading + " " + it.body
-    cat = next((name for name, pat in CATEGORY_PATTERNS if re.search(pat, t)), "その他")
-    muni = next((c for c in CITY_NAMES if c in t), None)
-    hints = ["小学校","中学校","高校","大学","学校","グラウンド","体育館","公園","駅","港","病院","交差点"]
-    places: List[str] = []
-    for h in hints:
-        places += re.findall(rf"([\w\u3040-\u30ff\u4e00-\u9fffA-Za-z0-9]+{h})", t)[:2]
+    cat = "その他"
+    for name, pat in CATEGORY_PATTERNS:
+        if re.search(pat, t):
+            cat = name; break
+    muni = None
+    for c in CITY_NAMES:
+        if c in t:
+            muni = c; break
+    places = []
+    for hint in ["小学校","中学校","高校","大学","学校","グラウンド","体育館","公園","駅","港","病院","交差点"]:
+        places += re.findall(rf"([\w\u3040-\u30ff\u4e00-\u9fffA-Za-z0-9]+{hint})", t)[:2]
     s = re.sub(r"\s+", " ", it.body).strip()
     s = s[:120] + ("…" if len(s)>120 else "")
     return {"category":cat,"municipality":muni,"place_strings":list(dict.fromkeys(places))[:3],
             "summary": s or it.heading, "date": it.incident_date}
 
+# ----------------------------------------------------------------------------
+# Gazetteer (optional external CSV)
+# ----------------------------------------------------------------------------
 @st.cache_resource
 def load_gazetteer(path:str) -> Optional[pd.DataFrame]:
     try:
@@ -296,7 +330,9 @@ class GazetteerIndex:
             r = self.df.iloc[hit[2]]; return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
         return None
 
-# Nominatim
+# ----------------------------------------------------------------------------
+# Nominatim fallback
+# ----------------------------------------------------------------------------
 
 def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[float,float]]:
     try:
@@ -315,7 +351,9 @@ def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[fl
     except Exception:
         return None
 
-# Gemini (optional)
+# ----------------------------------------------------------------------------
+# Gemini extraction (optional)
+# ----------------------------------------------------------------------------
 
 def _read_gemini_key() -> str:
     try:
@@ -329,7 +367,8 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
     api_key = _read_gemini_key()
     if not (_HAS_GEMINI and api_key):
         return []
-    key = hashlib.sha1(f"gem9|{muni_hint or ''}|{full_text}".encode("utf-8")).hexdigest()
+    key_src = f"gem9|{muni_hint or ''}|{full_text}"
+    key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
     cached = cache_get("llm_cache", key)
     if cached:
         try:
@@ -337,6 +376,7 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
             return obj.get("candidates", []) if isinstance(obj, dict) else []
         except Exception:
             pass
+
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
@@ -350,7 +390,8 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
         resp = model.generate_content(prompt)
         txt = resp.text if hasattr(resp, "text") else str(resp)
         start = txt.find("{"); end = txt.rfind("}")
-        if start >=0 and end>start: txt = txt[start:end+1]
+        if start >=0 and end>start:
+            txt = txt[start:end+1]
         obj = json.loads(txt)
         if isinstance(obj, dict):
             cache_put("llm_cache", key, json.dumps(obj, ensure_ascii=False))
@@ -364,22 +405,23 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
 # ----------------------------------------------------------------------------
 
 def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
-    if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)
-    return h3.latlng_to_cell(lat, lon, res)
+    if hasattr(h3, "geo_to_h3"):
+        return h3.geo_to_h3(lat, lon, res)  # v3
+    return h3.latlng_to_cell(lat, lon, res)  # v4
 
 def h3_latlng_from_cell(cell: str) -> Tuple[float,float]:
-    if hasattr(h3, "h3_to_geo"): lat, lon = h3.h3_to_geo(cell); return lat, lon
-    lat, lon = h3.cell_to_latlng(cell); return lat, lon
+    if hasattr(h3, "h3_to_geo"):
+        lat, lon = h3.h3_to_geo(cell); return lat, lon  # v3
+    lat, lon = h3.cell_to_latlng(cell); return lat, lon  # v4
 
 def h3_res_from_zoom(zoom_val:int) -> int:
     return {7:5,8:6,9:7,10:8,11:9,12:9,13:10,14:10}.get(zoom_val, 8)
 
 def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
-    if df.empty: return []
     res = h3_res_from_zoom(zoom_val)
     groups: Dict[str, List[Dict]] = {}
     for _, r in df.iterrows():
-        lon, lat = float(r["lon"]), float(r["lat"]) 
+        lon, lat = float(r["lon"]), float(r["lat"])
         cell = h3_cell_from_latlng(lat, lon, res)
         d = r.to_dict(); d["cell"] = cell
         groups.setdefault(cell, []).append(d)
@@ -398,197 +440,16 @@ def short_summary(s: str, max_len: int = 64) -> str:
     return (s[:max_len] + ("…" if len(s) > max_len else "")) if s else ""
 
 def make_prediction(category:str, muni:Optional[str]) -> str:
-    return {
-        "詐欺":"SNSや投資の誘いに注意。送金前に家族や警察へ相談。",
-        "交通事故":"夕方や雨天の交差点で増えやすい。横断と右左折に注意。",
-        "窃盗":"自転車・車両の施錠と防犯登録。夜間の無施錠放置を避ける。",
-        "火災":"乾燥時は屋外火気に配慮。電源周り・喫煙の始末を再確認。",
-        "事件":"不審連絡は記録を残し通報。学校・公共施設周辺で意識を。",
-        "死亡事案":"詳細は出典で確認。周辺では救急活動に配慮。",
-    }.get(category, "同種事案が続く可能性。出典で最新を確認。")
-
-CAT_STYLE = {
-    "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
-    "火災":     {"color":[245, 130, 50, 235],  "radius":88, "icon":"🔥"},
-    "死亡事案": {"color":[170, 120, 240, 235], "radius":92, "icon":"✖"},
-    "窃盗":     {"color":[70, 150, 245, 235],  "radius":78, "icon":"🔓"},
-    "詐欺":     {"color":[40, 180, 160, 235],  "radius":78, "icon":"⚠"},
-    "事件":     {"color":[245, 200, 60, 235],  "radius":82, "icon":"！"},
-    "その他":   {"color":[128, 144, 160, 220], "radius":70, "icon":"・"},
-}
+    if category == "詐欺":       return "SNSや投資の誘いに注意。送金前に家族や警察へ相談。"
+    if category == "交通事故":   return "夕方や雨天の交差点で増えやすい。横断と右左折に注意。"
+    if category == "窃盗":       return "自転車・車両の施錠と防犯登録。夜間の無施錠放置を避ける。"
+    if category == "火災":       return "乾燥時は屋外火気に配慮。電源周り・喫煙の始末を再確認。"
+    if category == "事件":       return "不審連絡は記録を残し通報。学校・公共施設周辺で意識を。"
+    if category == "死亡事案":   return "詳細は出典で確認。周辺では救急活動に配慮。"
+    return "同種事案が続く可能性。出典で最新を確認。"
 
 # ----------------------------------------------------------------------------
-# Builders (layers, tiles, viz)
-# ----------------------------------------------------------------------------
-
-def grid_color_range() -> List[List[int]]:
-    return [
-        [255, 180, 180, 60], [255, 140, 140, 90], [255, 100, 100, 120],
-        [230, 60, 60, 150], [200, 40, 40, 190], [180, 20, 20, 220],
-    ]
-
-def color_from_count_factory(max_count:int):
-    def _fn(c:int) -> List[int]:
-        t = max(0.0, min(1.0, (c-1) / max(1, max_count-1)))
-        if t < 0.5:
-            u = t/0.5; r = int(255*(1-u)+255*u); g = int(212*(1-u)+107*u); b = int(212*(1-u)+107*u)
-        else:
-            u = (t-0.5)/0.5; r = int(255*(1-u)+217*u); g = int(107*(1-u)+4*u); b = int(107*(1-u)+41*u)
-        return [r,g,b, 190 if c>=5 else 180]
-    return _fn
-
-def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> List[List[float]]:
-    out: List[List[float]] = []
-    r_earth = 6378137.0
-    dlat = radius_m / r_earth
-    dlon = radius_m / (r_earth * math.cos(math.radians(lat)))
-    for i in range(n):
-        ang = 2 * math.pi * i / n
-        lat_i = lat + math.degrees(dlat * math.sin(ang))
-        lon_i = lon + math.degrees(dlon * math.cos(math.radians(lat)))
-        out.append([lon_i, lat_i])
-    out.append(out[0])
-    return out
-
-def build_base_layers(map_choice:str, custom_tile:str) -> List[pdk.Layer]:
-    tile = TILESETS.get(map_choice, TILESETS["標準"])
-    layers: List[pdk.Layer] = [pdk.Layer("TileLayer", id=f"base-{map_choice}", data=tile["url"], min_zoom=0, max_zoom=tile.get("max_zoom",18), tile_size=256, opacity=1.0, refinement="no-overlap")]
-    if custom_tile.strip():
-        layers.append(pdk.Layer("TileLayer", id="custom-overlay", data=custom_tile.strip(), min_zoom=0, max_zoom=22, tile_size=256, opacity=0.6, refinement="no-overlap"))
-    return layers
-
-def tomtom_tile_url(kind:str, style:str, key:str) -> str:
-    if kind == "flow":
-        return f"https://api.tomtom.com/traffic/map/4/tile/flow/{style}/{{z}}/{{x}}/{{y}}.png?key={key}"
-    return f"https://api.tomtom.com/traffic/map/4/tile/incidents/{{z}}/{{x}}/{{y}}.png?key={key}"
-
-def build_overlay_layers(show_flow:bool, show_inc:bool, style:str, opacity:float, key:str) -> List[pdk.Layer]:
-    out: List[pdk.Layer] = []
-    if key:
-        if show_flow:
-            out.append(pdk.Layer("TileLayer", id=f"tomtom-flow-{style}", data=tomtom_tile_url("flow", style, key), min_zoom=0, max_zoom=22, tile_size=256, opacity=opacity, refinement="no-overlap"))
-        if show_inc:
-            out.append(pdk.Layer("TileLayer", id="tomtom-incidents", data=tomtom_tile_url("inc", style, key), min_zoom=0, max_zoom=22, tile_size=256, opacity=min(0.9, opacity), refinement="no-overlap"))
-    return out
-
-def build_intersection_layers(hot_df: pd.DataFrame, is_3d: bool) -> List[pdk.Layer]:
-    if hot_df.empty: return []
-    if is_3d:
-        return [pdk.Layer("ColumnLayer", id="hot-columns", data=hot_df, get_position="position", get_elevation="elev", elevation_scale=1.0, radius=65, get_fill_color="rgba", pickable=True, extruded=True)]
-    return [pdk.Layer("HeatmapLayer", id="hot-heatmap", data=hot_df, get_position="position", get_weight="weight", radius_pixels=60, intensity=0.85, threshold=0.05, opacity=0.35, pickable=False)]
-
-def build_congestion_grid(df: pd.DataFrame, is_3d: bool) -> List[pdk.Layer]:
-    if is_3d or df.empty: return []
-    acc = df[df["category"]=="交通事故"].copy()
-    if acc.empty: return []
-    acc["position"] = acc.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
-    acc["weight"] = 1.0
-    return [pdk.Layer("GridLayer", id="congestion-grid", data=acc, get_position="position", get_weight="weight", cell_size=200, extruded=False, opacity=0.18, pickable=False, aggregation="SUM", colorRange=grid_color_range())]
-
-def spiderfy(clon: float, clat: float, n: int, base_px: int = 16, gap_px: int = 8) -> List[Tuple[float,float]]:
-    out = []; rpx = base_px
-    for k in range(n):
-        ang = math.radians(137.5 * k)
-        dx = rpx*math.cos(ang); dy = rpx*math.sin(ang)
-        dlon = dx / (111320 * math.cos(math.radians(clat))); dlat = dy / 110540
-        out.append((clon + dlon, clat + dlat)); rpx += gap_px
-    return out
-
-def build_points_labels_buffers(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], Dict]:
-    centers = cluster_points(df, ZOOM_LIKE)
-    points: List[Dict] = []; icon_fg: List[Dict] = []; mini_fg: List[Dict] = []; mini_bg: List[Dict] = []
-    features: List[Dict] = []
-    for c in centers:
-        cnt = c["count"]; clat, clon = c["lat"], c["lon"]
-        if cnt <= FANOUT_THRESHOLD:
-            offs = spiderfy(clon, clat, cnt)
-            for (lon, lat), row in zip(offs, c["rows"]):
-                sty = CAT_STYLE.get(row["category"], CAT_STYLE["その他"])
-                p = {"position":[lon,lat], "color":sty["color"], "radius":sty["radius"], "c":row["category"],
-                     "s":row.get("summary",""), "m":row.get("municipality",""), "pred":row.get("pred",""),
-                     "src":row.get("src", EHIME_POLICE_URL), "r":int(row.get("radius_m",600)), "ico":sty["icon"]}
-                points.append(p)
-                icon_fg.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
-                if len(mini_fg) < MAX_LABELS:
-                    vtxt = (row.get("summary","")[:4])
-                    vtxt = "\n".join(list(vtxt))
-                    offset_px = int(-14*LABEL_SCALE)
-                    mini_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
-                    mini_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
-        else:
-            points.append({"position":[clon,clat],"color":[100,100,100,210],"radius":70,"c":"集中","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎"})
-            icon_fg.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
-    for p in points:
-        if p.get("r",0) > 0:
-            lon, lat = p["position"]
-            features.append({"type":"Feature","geometry":{"type":"Polygon","coordinates":[circle_coords(lon, lat, int(p["r"]))]},"properties":{}})
-    geojson = {"type":"FeatureCollection","features": features}
-    return points, icon_fg, mini_fg, mini_bg, geojson
-
-# ----------------------------------------------------------------------------
-# UI Builders
-# ----------------------------------------------------------------------------
-
-def render_layer_picker(tomtom_opacity:float):
-    # 右下のレイヤFAB + パネル
-    st.markdown("<div class='layers-fab'>", unsafe_allow_html=True)
-    st.markdown("<div class='btn'>🗺️</div>", unsafe_allow_html=True)
-    with st.expander("地図・レイヤ", expanded=False):
-        st.markdown("<div class='layers-panel'>", unsafe_allow_html=True)
-        # サムネグリッド
-        names = list(TILESETS.keys())
-        cols = st.columns(4)
-        for i, name in enumerate(names):
-            with cols[i % 4]:
-                thumb = TILESETS[name]["thumb"]
-                active = (name == st.session_state.map_choice)
-                st.markdown(f"<div class='card{' active' if active else ''}'><img class='thumb' src='{thumb}'/><div class='label'><span>{name}</span>" + ("<span>✓</span>" if active else "") + "</div></div>", unsafe_allow_html=True)
-                if st.button(f"{name} に切替", key=f"pick-{name}", use_container_width=True):
-                    st.session_state.map_choice = name
-                    st.rerun()
-        # TomTomトグル
-        c1, c2, c3 = st.columns([1,1,2])
-        with c1:
-            new_flow = st.toggle("渋滞Flow", value=bool(st.session_state.show_tomtom_flow), key="hud-flow")
-        with c2:
-            new_inc  = st.toggle("事象Inc", value=bool(st.session_state.show_tomtom_inc), key="hud-inc")
-        with c3:
-            st.session_state.tomtom_style = st.selectbox("Flowスタイル", ["relative0","relative1","absolute","relative0-dark","absolute-dark"], index=["relative0","relative1","absolute","relative0-dark","absolute-dark"].index(st.session_state.tomtom_style))
-        changed = (new_flow != st.session_state.show_tomtom_flow) or (new_inc != st.session_state.show_tomtom_inc)
-        st.session_state.show_tomtom_flow = new_flow
-        st.session_state.show_tomtom_inc = new_inc
-        if changed: st.rerun()
-        # 帰属
-        atts = ", ".join(sorted({TILESETS[n]["copyright"] for n in names}))
-        st.caption(f"地図タイル: {atts} / TomTom Trafficはキー必須")
-        st.markdown("</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-def render_tomtom_selfcheck(style:str, key:str):
-    with st.expander("TomTom タイル健診（表示されない時の診断）", expanded=False):
-        if not key:
-            st.info("TOMTOM_API_KEY が未設定です。secrets に設定してください。")
-            return
-        z = 14; lat, lon = EHIME_PREF_LAT, EHIME_PREF_LON
-        n = 2.0 ** z
-        xtile = int((lon + 180.0) / 360.0 * n)
-        lat_rad = math.radians(lat)
-        ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-        test_url = tomtom_tile_url("flow", style, key).format(z=z, x=xtile, y=ytile)
-        st.code(test_url, language="text")
-        try:
-            rr = requests.get(test_url, timeout=8)
-            st.write("HTTP:", rr.status_code)
-            if rr.ok and rr.headers.get("content-type","{}").startswith("image/"):
-                st.image(rr.content, caption="Flow タイル 1枚テスト（ズーム14, 松山付近）")
-            else:
-                st.warning("画像が返っていません。Referer制限 / スタイル名 / キー権限を確認してください。")
-        except Exception as e:
-            st.error(f"取得エラー: {e}")
-
-# ----------------------------------------------------------------------------
-# Data pipeline
+# Pipeline（速報→抽出→座標推定）
 # ----------------------------------------------------------------------------
 with st.spinner("速報を取得中…"):
     html = fetch_ehime_html()
@@ -606,7 +467,8 @@ gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
 def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
-    return None if not idx else idx.search(name, min_score)
+    if not idx: return None
+    return idx.search(name, min_score)
 
 def resolve_loc(ex: Dict) -> Dict:
     muni = ex.get("municipality"); places = ex.get("place_strings") or []
@@ -638,7 +500,8 @@ for ex, loc in zip(extracted, results):
     radius = int(base_radius * FUTURE_BUFFER_SCALE)
     rows.append({
         "lon": float(loc["lon"]), "lat": float(loc["lat"]),
-        "category": ex["category"], "summary": short_summary(ex["summary"], 60),
+        "category": ex["category"],
+        "summary": short_summary(ex["summary"], 60),
         "municipality": ex.get("municipality") or "",
         "radius_m": radius,
         "pred": make_prediction(ex["category"], ex.get("municipality")),
@@ -647,7 +510,9 @@ for ex, loc in zip(extracted, results):
 
 df = pd.DataFrame(rows)
 
-# 多発交差点（内蔵）
+# ----------------------------------------------------------------------------
+# 多発交差点 CSV（内蔵）
+# ----------------------------------------------------------------------------
 CSV_TEXT = """地点名,緯度,経度,年間最多事故件数,補足
 天山交差点,33.8223,132.7758,6,松山市天山町付近（2023年に6件事故）
 和泉交差点,33.8216,132.7554,5,松山市和泉町付近（2023年に5件事故）
@@ -666,42 +531,258 @@ hot_df["count"] = hot_df["count"].astype(int)
 max_count = int(hot_df["count"].max()) if not hot_df.empty else 1
 hot_df["position"] = hot_df.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
 hot_df["weight"] = hot_df["count"].astype(float)
-color_from_count = color_from_count_factory(max_count)
+
+def color_from_count(c:int) -> List[int]:
+    t = max(0.0, min(1.0, (c-1) / max(1, max_count-1)))
+    if t < 0.5:
+        u = t/0.5
+        r = int(255*(1-u) + 255*u)
+        g = int(212*(1-u) + 107*u)
+        b = int(212*(1-u) + 107*u)
+    else:
+        u = (t-0.5)/0.5
+        r = int(255*(1-u) + 217*u)
+        g = int(107*(1-u) + 4*u)
+        b = int(107*(1-u) + 41*u)
+    alpha = 190 if c>=5 else 180
+    return [r,g,b,alpha]
+
 hot_df["rgba"] = hot_df["count"].apply(color_from_count)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)
 
 # ----------------------------------------------------------------------------
-# Layout
+# Category styles
+# ----------------------------------------------------------------------------
+CAT_STYLE = {
+    "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
+    "火災":     {"color":[245, 130, 50, 235],  "radius":88, "icon":"🔥"},
+    "死亡事案": {"color":[170, 120, 240, 235], "radius":92, "icon":"✖"},
+    "窃盗":     {"color":[70, 150, 245, 235],  "radius":78, "icon":"🔓"},
+    "詐欺":     {"color":[40, 180, 160, 235],  "radius":78, "icon":"⚠"},
+    "事件":     {"color":[245, 200, 60, 235],  "radius":82, "icon":"！"},
+    "その他":   {"color":[128, 144, 160, 220], "radius":70, "icon":"・"},
+}
+
+# ----------------------------------------------------------------------------
+# Cluster → spiderfy → points & labels & buffers
+# ----------------------------------------------------------------------------
+vis_df = df
+centers = cluster_points(vis_df, ZOOM_LIKE) if not vis_df.empty else []
+
+def spiderfy(clon: float, clat: float, n: int, base_px: int = 16, gap_px: int = 8):
+    out = []; rpx = base_px
+    for k in range(n):
+        ang = math.radians(137.5 * k)
+        dx = rpx*math.cos(ang); dy = rpx*math.sin(ang)
+        dlon = dx / (111320 * math.cos(math.radians(clat))); dlat = dy / 110540
+        out.append((clon + dlon, clat + dlat)); rpx += gap_px
+    return out
+
+points: List[Dict] = []
+icon_labels: List[Dict] = []
+mini_labels_fg: List[Dict] = []
+mini_labels_bg: List[Dict] = []
+
+for c in centers:
+    cnt = c["count"]; clat, clon = c["lat"], c["lon"]
+    if cnt <= FANOUT_THRESHOLD:
+        offs = spiderfy(clon, clat, cnt, base_px=16, gap_px=8)
+        for (lon, lat), row in zip(offs, c["rows"]):
+            sty = CAT_STYLE.get(row["category"], CAT_STYLE["その他"])
+            points.append({
+                "position":[lon,lat], "color":sty["color"], "radius":sty["radius"],
+                "c":row["category"], "s":row["summary"], "m":row.get("municipality",""),
+                "pred": row.get("pred",""), "src": row.get("src", EHIME_POLICE_URL),
+                "r": int(row.get("radius_m", 600)),
+                "ico": sty["icon"],
+            })
+            icon_labels.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
+            if len(mini_labels_fg) < MAX_LABELS:
+                vtxt = (row["summary"] or "")[:4]
+                vtxt = "\n".join(list(vtxt))
+                offset_px = int(-14*LABEL_SCALE)
+                mini_labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
+                mini_labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
+    else:
+        points.append({"position":[clon,clat],"color":[100,100,100,210],"radius":70,"c":"集中","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎"})
+        icon_labels.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
+
+# buffer polygons (approximate circles)
+
+def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
+    coords = []
+    r_earth = 6378137.0
+    dlat = radius_m / r_earth
+    dlon = radius_m / (r_earth * math.cos(math.radians(lat)))
+    for i in range(n):
+        ang = 2 * math.pi * i / n
+        lat_i = lat + math.degrees(dlat * math.sin(ang))
+        lon_i = lon + math.degrees(dlon * math.cos(math.radians(lat)))
+        coords.append([lon_i, lat_i])
+    coords.append(coords[0])
+    return coords
+
+geo_features = []
+for p in points:
+    if p.get("r",0) > 0:
+        lon, lat = p["position"][0], p["position"][1]
+        geo_features.append({
+            "type":"Feature",
+            "geometry":{"type":"Polygon","coordinates":[circle_coords(lon, lat, int(p["r"]))]},
+            "properties":{}
+        })
+geojson = {"type":"FeatureCollection","features": geo_features}
+
+# ----------------------------------------------------------------------------
+# Map column & feed column
 # ----------------------------------------------------------------------------
 col_map, col_feed = st.columns([7,5], gap="large")
 
-with col_map:
-    # --- sidebar ---
-    with st.sidebar:
-        st.markdown("<div class='panel'>", unsafe_allow_html=True)
-        st.markdown("#### 表示期間")
-        period = st.select_slider("表示期間を選択", ["当日","過去3日","過去7日","過去30日"], value="過去7日", label_visibility="collapsed")
-        st.markdown("#### 表示モード")
-        mode_3d = st.radio("2D / 3D", ["2D","3D"], horizontal=True, index=0)
-        init_zoom = st.slider("初期ズーム", 8, 17, 11)
-        st.markdown("#### TomTom 渋滞（詳細設定）")
-        st.session_state.tomtom_style = st.selectbox("Flow スタイル", ["relative0","relative1","absolute","relative0-dark","absolute-dark"], index=["relative0","relative1","absolute","relative0-dark","absolute-dark"].index(st.session_state.tomtom_style))
-        st.session_state.show_tomtom_flow = st.checkbox("TomTom Flow を重ねる", value=bool(st.session_state.show_tomtom_flow))
-        st.session_state.show_tomtom_inc  = st.checkbox("TomTom Incidents を重ねる", value=bool(st.session_state.show_tomtom_inc))
-        tomtom_opacity   = st.slider("TomTom タイル不透明度", 0.0, 1.0, 0.75, 0.05)
-        st.markdown("#### 任意タイルURL（透過PNG推奨）")
-        custom_tile = st.text_input("例: https://…/{z}/{x}/{y}.png", "")
-        st.markdown("</div>", unsafe_allow_html=True)
+# ---- タイル定義（サムネ用途の静的URLも併記） ----
+TILESETS = {
+    # Google Mapsの「地図/地形/航空写真」を参考に命名と並び順
+    "標準": {"url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "max_zoom": 19,
+           "thumb": "https://tile.openstreetmap.org/14/14553/6620.png"},
+    "淡色": {"url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", "max_zoom": 18,
+           "thumb": "https://cyberjapandata.gsi.go.jp/xyz/pale/14/14553/6620.png"},
+    "地形": {"url": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png", "max_zoom": 17,
+           "thumb": "https://a.tile.opentopomap.org/14/14553/6620.png"},
+    "人道支援": {"url": "https://tile-a.openstreetmap.fr/hot/{z}/{x}/{y}.png", "max_zoom": 19,
+             "thumb": "https://tile-a.openstreetmap.fr/hot/14/14553/6620.png"},
+}
 
+with col_map:
+    map_choice = st.session_state.map_choice
+    TILE = TILESETS.get(map_choice, TILESETS["標準"])
     is_3d = (mode_3d == "3D")
 
-    # --- deck layers ---
-    layers: List[pdk.Layer] = []
-    layers += build_base_layers(st.session_state.map_choice, custom_tile)
-    layers += build_intersection_layers(hot_df, is_3d)
-    layers += build_congestion_grid(df, is_3d)
+    # intersections: heat or columns
+    intersection_layers: List[pdk.Layer] = []
+    if not hot_df.empty:
+        if is_3d:
+            intersection_layers.append(
+                pdk.Layer(
+                    "ColumnLayer",
+                    id="hot-columns",
+                    data=hot_df,
+                    get_position="position",
+                    get_elevation="elev",
+                    elevation_scale=1.0,
+                    radius=65,
+                    get_fill_color="rgba",
+                    pickable=True,
+                    extruded=True,
+                )
+            )
+        else:
+            intersection_layers.append(
+                pdk.Layer(
+                    "HeatmapLayer",
+                    id="hot-heatmap",
+                    data=hot_df,
+                    get_position="position",
+                    get_weight="weight",
+                    radius_pixels=60,
+                    intensity=0.85,
+                    threshold=0.05,
+                    opacity=0.35,
+                    pickable=False,
+                )
+            )
 
-    points, icon_labels, mini_fg, mini_bg, geojson = build_points_labels_buffers(df)
+    # light congestion grid (from accidents)
+    congestion_layer = None
+    if (not df.empty) and (not is_3d):
+        acc = df[df["category"] == "交通事故"].copy()
+        if not acc.empty:
+            acc["position"] = acc.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
+            acc["weight"] = 1.0
+            congestion_layer = pdk.Layer(
+                "GridLayer",
+                id="congestion-grid",
+                data=acc,
+                get_position="position",
+                get_weight="weight",
+                cell_size=200,
+                extruded=False,
+                opacity=0.18,
+                pickable=False,
+                aggregation="SUM",
+                colorRange=[
+                    [255, 180, 180, 60],
+                    [255, 140, 140, 90],
+                    [255, 100, 100, 120],
+                    [230, 60, 60, 150],
+                    [200, 40, 40, 190],
+                    [180, 20, 20, 220],
+                ],
+            )
+
+    # build layers with unique ids
+    layers: List[pdk.Layer] = []
+    layers.append(
+        pdk.Layer(
+            "TileLayer",
+            id=f"base-{map_choice}",
+            data=TILE["url"],
+            min_zoom=0,
+            max_zoom=TILE.get("max_zoom", 18),
+            tile_size=256,
+            opacity=1.0,
+            refinement="no-overlap",
+        )
+    )
+
+    if custom_tile.strip():
+        layers.append(
+            pdk.Layer(
+                "TileLayer",
+                id="custom-overlay",
+                data=custom_tile.strip(),
+                min_zoom=0,
+                max_zoom=22,
+                tile_size=256,
+                opacity=0.6,
+                refinement="no-overlap",
+            )
+        )
+
+    tomtom_key = get_tomtom_key()
+    if st.session_state.show_tomtom_flow and tomtom_key:
+        flow_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{st.session_state.tomtom_style}/{{z}}/{{x}}/{{y}}.png?key={tomtom_key}"
+        layers.append(
+            pdk.Layer(
+                "TileLayer",
+                id=f"tomtom-flow-{st.session_state.tomtom_style}",
+                data=flow_url,
+                min_zoom=0,
+                max_zoom=22,
+                tile_size=256,
+                opacity=tomtom_opacity,
+                refinement="no-overlap",
+            )
+        )
+    if st.session_state.show_tomtom_inc and tomtom_key:
+        inc_url = f"https://api.tomtom.com/traffic/map/4/tile/incidents/{{z}}/{{x}}/{{y}}.png?key={tomtom_key}"
+        layers.append(
+            pdk.Layer(
+                "TileLayer",
+                id="tomtom-incidents",
+                data=inc_url,
+                min_zoom=0,
+                max_zoom=22,
+                tile_size=256,
+                opacity=min(0.9, tomtom_opacity),
+                refinement="no-overlap",
+            )
+        )
+
+    for L in intersection_layers:
+        layers.append(L)
+    if congestion_layer is not None:
+        layers.append(congestion_layer)
+
+    # points / labels / buffers
     layers += [
         pdk.Layer("GeoJsonLayer", id="approx-buffers", data=geojson, pickable=False, stroked=True, filled=True,
                   get_line_width=2, get_line_color=[0,160,220], get_fill_color=[0,160,220,40], auto_highlight=False),
@@ -709,14 +790,11 @@ with col_map:
                   pickable=True, radius_min_pixels=3, radius_max_pixels=60),
         pdk.Layer("TextLayer", id="icon-labels", data=icon_labels, get_position="position", get_text="label", get_color="tcolor",
                   get_size=14, get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
-        pdk.Layer("TextLayer", id="mini-labels-bg", data=mini_bg, get_position="position", get_text="label", get_color="tcolor",
+        pdk.Layer("TextLayer", id="mini-labels-bg", data=mini_labels_bg, get_position="position", get_text="label", get_color="tcolor",
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
-        pdk.Layer("TextLayer", id="mini-labels-fg", data=mini_fg, get_position="position", get_text="label", get_color="tcolor",
+        pdk.Layer("TextLayer", id="mini-labels-fg", data=mini_labels_fg, get_position="position", get_text="label", get_color="tcolor",
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
-
-    tomtom_key = get_tomtom_key()
-    layers += build_overlay_layers(st.session_state.show_tomtom_flow, st.session_state.show_tomtom_inc, st.session_state.tomtom_style, tomtom_opacity, tomtom_key)
 
     tooltip_html = (
         "<div style='min-width:180px'>"
@@ -724,36 +802,101 @@ with col_map:
         f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a>"
         "</div>"
     )
-
     deck = pdk.Deck(
         layers=layers,
         initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=init_zoom, pitch=(45 if is_3d else 0), bearing=0),
         tooltip={
             "html": tooltip_html,
-            "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"320px","whiteSpace":"normal","wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px","borderRadius":"12px","border":"1px solid var(--border)"}
+            "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"320px","whiteSpace":"normal",
+                      "wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px",
+                      "borderRadius":"12px","border":"1px solid var(--border)"}
         },
         map_provider=None, map_style=None
     )
     st.pydeck_chart(deck, use_container_width=True, height=620)
 
-    # HUD
+    # ---- HUD（初期ズーム） ----
     st.markdown("<div class='hud'><div class='hud-inner'>" + f"<div class='badge'>Zoom: {init_zoom}（初期）</div>" + "</div></div>", unsafe_allow_html=True)
 
-    # GMaps風レイヤピッカー & TomTom診断
-    render_layer_picker(tomtom_opacity)
-    render_tomtom_selfcheck(st.session_state.tomtom_style, tomtom_key)
+    # ---- 右下：Google Maps風 レイヤーフローティングボタン＆パネル ----
+    with st.container():
+        # Streamlitレイアウト外の絶対配置
+        st.markdown("<div class='layers-fab'>", unsafe_allow_html=True)
+
+        # パネルはexpanderで模擬（モバイル配慮）。ボタンは装飾用。
+        c_fab = st.columns([1])
+        with c_fab[0]:
+            st.markdown("<div class='btn'>🗺️</div>", unsafe_allow_html=True)
+            with st.expander("地図・レイヤ", expanded=False):
+                st.markdown("<div class='layers-panel'>", unsafe_allow_html=True)
+
+                # ---- サムネ付マップ選択（Google Maps風） ----
+                cols = st.columns(4)
+                names = list(TILESETS.keys())  # 並び固定
+                for i, name in enumerate(names):
+                    with cols[i % 4]:
+                        thumb = TILESETS[name]["thumb"]
+                        active = " active" if name == st.session_state.map_choice else ""
+                        st.markdown(f"<div class='card{active}'><img class='thumb' src='{thumb}'/><div class='label'><span>{name}</span>" + ("<span>✓</span>" if active else "") + "</div></div>", unsafe_allow_html=True)
+                        if st.button(f"{name} に切替", key=f"pick-{name}", use_container_width=True):
+                            st.session_state.map_choice = name
+                            st.rerun()
+
+                # ---- オーバーレイ（TomTom）トグル（簡易） ----
+                st.markdown("<div class='toggles'>", unsafe_allow_html=True)
+                c1, c2, c3 = st.columns([1,1,2])
+                with c1:
+                    new_flow = st.toggle("渋滞Flow", value=bool(st.session_state.show_tomtom_flow), key="hud-flow")
+                with c2:
+                    new_inc  = st.toggle("事象Inc", value=bool(st.session_state.show_tomtom_inc), key="hud-inc")
+                with c3:
+                    st.session_state.tomtom_style = st.selectbox("Flowスタイル", ["relative0","relative1","absolute","relative0-dark","absolute-dark"], index=["relative0","relative1","absolute","relative0-dark","absolute-dark"].index(st.session_state.tomtom_style))
+                st.markdown("</div>", unsafe_allow_html=True)
+
+                # 反映
+                changed = (new_flow != st.session_state.show_tomtom_flow) or (new_inc != st.session_state.show_tomtom_inc)
+                st.session_state.show_tomtom_flow = new_flow
+                st.session_state.show_tomtom_inc = new_inc
+                if changed:
+                    st.rerun()
+
+                st.markdown("</div>", unsafe_allow_html=True)  # /layers-panel
+        st.markdown("</div>", unsafe_allow_html=True)  # /layers-fab
+
+    # ---- TomTom tile self-check ----
+    with st.expander("TomTom タイル健診（表示されない時の診断）", expanded=False):
+        if tomtom_key:
+            z = 14
+            lat, lon = EHIME_PREF_LAT, EHIME_PREF_LON
+            n = 2.0 ** z
+            xtile = int((lon + 180.0) / 360.0 * n)
+            lat_rad = math.radians(lat)
+            ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+            test_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{st.session_state.tomtom_style}/{z}/{xtile}/{ytile}.png?key={tomtom_key}"
+            st.code(test_url, language="text")
+            try:
+                rr = requests.get(test_url, timeout=8)
+                st.write("HTTP:", rr.status_code)
+                if rr.ok and rr.headers.get("content-type","{}").startswith("image/"):
+                    st.image(rr.content, caption="Flow タイル 1枚テスト（ズーム14, 松山付近）")
+                else:
+                    st.warning("画像が返っていません。Referer制限 / スタイル名 / キー権限を確認してください。")
+            except Exception as e:
+                st.error(f"取得エラー: {e}")
+        else:
+            st.info("TOMTOM_API_KEY が未設定です。secrets に設定してください。")
 
     # legend
     legend_items = []
     for k, v in CAT_STYLE.items():
         rgba = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{rgba}'></span>{k}</span>")
-    st.markdown(
+    legend_html = (
         f"<div class='legend'>{''.join(legend_items)}"
         f"<div style='margin-top:10px'><div class='riskbar'></div>"
-        f"<div class='risklbl'><span>交差点リスク（低）</span><span>高：最大 {int(hot_df['count'].max()) if not hot_df.empty else 0}件/年</span></div></div></div>",
-        unsafe_allow_html=True,
+        f"<div class='risklbl'><span>交差点リスク（低）</span><span>高：最大 {max_count}件/年</span></div></div></div>"
     )
+    st.markdown(legend_html, unsafe_allow_html=True)
 
 with col_feed:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
@@ -783,4 +926,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真（APIキー不要） | TomTom Traffic（要キー） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
+st.caption("地図: OSM / GSI / OpenTopoMap（APIキー不要） | TomTom Traffic（要キー） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
