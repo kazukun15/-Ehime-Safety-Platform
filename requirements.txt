@@ -7,3 +7,4 @@ rapidfuzz
 h3
 google-generativeai  # 任意（未設定でもOK）
 httpx
+streamlit-autorefresh
