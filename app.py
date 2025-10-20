@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
 import h3
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
+APP_TITLE = "愛媛セーフティ・プラットフォーム"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
 USER_AGENT = "ESP/7.3 (ux/map2d3d)"
 TIMEOUT = 12
