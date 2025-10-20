@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム v9.9-A5
-# - ツールチップは {info_html} 統一（未展開の {c}{s}{m}{pred} を完全排除）
-# - JARTIC 点/線ホバー：時刻（JST）・合計・上り・下り
-# - 擬似渋滞線の長さを 0〜10km に線形スケーリング (length_m = clamp(total*20, 0, 10_000))
-# - 擬似渋滞線は OSMの「該当ウェイの折れ線に沿うサブパス」を抽出して描画（道路の向きに厳密追従）
-# - 既存機能維持：速報→位置推定、交差点ヒート/3D柱 ON/OFF、JARTIC 点、フェールセーフ、フィード 等
+# 愛媛セーフティ・プラットフォーム v9.9-A6 (ticker fix)
+# - ニュースティッカー: 県警速報＋JARTIC上位要約をトップバー直下に表示
+# - NameError修正：JARTICを地図レンダ前に取得してティッカーに供給、地図側は結果を再利用
+# - 既存: JARTIC点/線、OSMスナップ(0〜10km)、危険交差点ON/OFF、県警速報→位置推定 等
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -29,9 +27,9 @@ try:
 except Exception:
     _HAS_GEMINI = False
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム"
+APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A5 (info_html+snap_subpath_0_10km)"
+USER_AGENT = "ESP/9.9-A6 (ticker+snap_subpath_0_10km)"
 TIMEOUT = 15
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -106,59 +104,21 @@ st.markdown("""
   @media (prefers-color-scheme: light){ .hud .badge{ background:rgba(255,255,255,.9); color:#0f2230; } }
   .jartic-grad { height: 10px; border-radius:6px; background: linear-gradient(90deg, #3c78c8, #4ec67a, #f0d438, #e63c3c); }
   .redline-sample { height: 0; border-top:4px solid #e60000; width: 80px; border-radius:2px; }
+  /* ticker */
+  .ticker-wrap{ position:sticky; top:58px; z-index:9; margin:-12px -16px 10px -16px;
+                background:var(--panel2); border-bottom:1px solid var(--border); overflow:hidden; }
+  .ticker{ display:inline-block; white-space:nowrap; padding:6px 0; animation: ticker-move 28s linear infinite; }
+  .ticker:hover{ animation-play-state: paused; }
+  @keyframes ticker-move { 0%{ transform: translateX(100%);} 100%{ transform: translateX(-100%);} }
+  @media (prefers-reduced-motion: reduce){ .ticker{ animation: none; } }
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown(
     "<div class='topbar'><div class='brand'><div class='id'>ES</div>"
-    f"<div><div>{APP_TITLE}</div><div class='subnote'>Save Your Self</div></div>"
+    f"<div><div>{APP_TITLE}</div><div class='subnote'>今に強い・先を読む。地図で一目、要点は簡潔。</div></div>"
     "</div></div>", unsafe_allow_html=True
 )
-# === ニュース・ティッカー（トップバー直下に設置） ===
-def build_ticker_items(incidents_df: pd.DataFrame, jartic_points: List[Dict], tlabel: Optional[str]) -> List[str]:
-    items: List[str] = []
-    # 1) 県警速報（最新順に先頭数件）
-    for _, r in incidents_df.head(12).iterrows():
-        cat = r.get("category","")
-        muni = r.get("municipality","") or ""
-        s = r.get("summary","")
-        if s:
-            items.append(f"{muni} {s}")
-    # 2) JARTIC要旨（多量順に先頭数件）
-    if jartic_points and tlabel:
-        top = sorted(jartic_points, key=lambda p: p.get("total",0), reverse=True)[:8]
-        for p in top:
-            total, up, down = p.get("total",0), p.get("up",0), p.get("down",0)
-            items.append(f"【交通量 {tlabel}】合計{total}台/5分（↑{up} / ↓{down}）")
-    return items
-
-def render_ticker_html(lines: List[str]) -> None:
-    if not lines: return
-    text = "　｜　".join(lines)  # 区切り
-    st.markdown("""
-    <style>
-      .ticker-wrap{ position:sticky; top:58px; z-index:9; margin:-12px -16px 10px -16px;
-                    background:var(--panel2); border-bottom:1px solid var(--border); overflow:hidden; }
-      .ticker{ display:inline-block; white-space:nowrap; padding:6px 0; animation: ticker-move 28s linear infinite; }
-      .ticker:hover{ animation-play-state: paused; }
-      @keyframes ticker-move {
-        0%{ transform: translateX(100%); }
-        100%{ transform: translateX(-100%); }
-      }
-      @media (prefers-reduced-motion: reduce){
-        .ticker{ animation: none; }
-      }
-    </style>
-    """, unsafe_allow_html=True)
-    st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{text}</div></div>", unsafe_allow_html=True)
-
-# ▼ 既存のJARTIC取得後の場所で呼ぶ（j_points, tlabel が揃った段階）
-# 例：col_map内でレイヤ組み立てた後に
-ticker_lines = build_ticker_items(df, j_points, tlabel)
-render_ticker_html(ticker_lines)
-
-# ▼ 自動更新（任意）：5分に1回リロード
-st.autorefresh(interval=5*60*1000, key="ticker_refresh")
 
 # ----------------------------------------------------------------------------
 # Session state
@@ -200,8 +160,6 @@ class IncidentItem:
     heading: str
     body: str
     incident_date: Optional[str]
-
-EHIME_POLICE_URL_TXT = EHIME_POLICE_URL
 
 @st.cache_data(ttl=TTL_HTML)
 def fetch_ehime_html() -> str:
@@ -387,13 +345,13 @@ def short_summary(s: str, max_len: int = 64) -> str:
 
 def make_prediction(category:str, muni:Optional[str]) -> str:
     return {
-        "詐欺":"SNSや投資の誘いに注意してください。送金前に家族や警察へ相談を。",
-        "交通事故":"夕方や雨天の交差点で増えやすい。横断時右左折に注意。",
+        "詐欺":"SNSや投資の誘いに注意。送金前に家族や警察へ相談。",
+        "交通事故":"夕方や雨天の交差点で増えやすい。横断と右左折に注意。",
         "窃盗":"自転車・車両の施錠と防犯登録。夜間の無施錠放置を避ける。",
-        "火災":"乾燥時は屋外火気に配慮し、電源周り・喫煙の始末の再確認をしてください。。",
-        "事件":"不審連絡は記録を残し通報。学校・公共施設周辺で意識してください。",
-        "死亡事案":"詳細は出典で確認してください。現場周辺では救急活動に配慮してください。",
-    }.get(category, "同種事案が続く可能性があります。出典で最新を確認。")
+        "火災":"乾燥時は屋外火気に配慮。電源周り・喫煙の始末を再確認。",
+        "事件":"不審連絡は記録を残し通報。学校・公共施設周辺で意識を。",
+        "死亡事案":"詳細は出典で確認。周辺では救急活動に配慮。",
+    }.get(category, "同種事案が続く可能性。出典で最新を確認。")
 
 CAT_STYLE = {
     "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
@@ -405,7 +363,6 @@ CAT_STYLE = {
     "その他":   {"color":[128, 144, 160, 220], "radius":70, "icon":"・"},
 }
 
-# ---- tooltip html makers ----
 def make_incident_info_html(c:str, s:str, m:str, pred:str) -> str:
     parts = []
     if c: parts.append(f"<b>{c}</b>")
@@ -439,10 +396,7 @@ def round_to_5min(d: datetime) -> datetime:
 
 @st.cache_data(ttl=180)
 def fetch_jartic_5min(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> Tuple[Optional[Dict], Optional[str]]:
-    """
-    Returns: (geojson, tlabel) where tlabel like 'YYYY-MM-DD HH:MM (JST)'
-    """
-    # JARTICの公開は約20分遅延、5分刻み
+    # 約20分遅延、5分刻み
     t = round_to_5min(jst_now() - timedelta(minutes=20))
     tcode = t.strftime("%Y%m%d%H%M")
     tlabel = t.strftime("%Y-%m-%d %H:%M (JST)")
@@ -497,7 +451,6 @@ def color_from_total(total:int) -> List[int]:
     return [r,g,b, 230]
 
 def size_from_total(total:int) -> int:
-    # 点を大きめに
     return 48 + int(min(260, total * 0.9))
 
 # ----------------------------------------------------------------------------
@@ -507,11 +460,6 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 @st.cache_data(ttl=600)
 def fetch_osm_roads_overpass(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> List[Dict]:
-    """
-    指定BBOX内の主要道路ウェイを取得し、各ウェイを
-      {"coords":[[lon,lat],...], "oneway":bool}
-    形式で返す。
-    """
     minLon, minLat, maxLon, maxLat = bbox
     q = f"""
     [out:json][timeout:25];
@@ -537,7 +485,6 @@ def fetch_osm_roads_overpass(bbox: Tuple[float,float,float,float] = EHIME_BBOX) 
         return []
 
 def _meters_scale(lat: float) -> Tuple[float,float]:
-    # 1度あたりの距離（近似）
     return 111320 * math.cos(math.radians(lat)), 110540
 
 def _dist_m(a: Tuple[float,float], b: Tuple[float,float]) -> float:
@@ -546,9 +493,6 @@ def _dist_m(a: Tuple[float,float], b: Tuple[float,float]) -> float:
     return math.hypot((lon2-lon1)*kx, (lat2-lat1)*ky)
 
 def _project_to_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[float,float]) -> Tuple[Tuple[float,float], float, float]:
-    """
-    p を線分abに直交射影。戻り値=(projLonLat, t[0..1], dist_m)
-    """
     ax, ay = a; bx, by = b; px, py = p
     kx, ky = _meters_scale((ay+by)/2)
     ax2, ay2, bx2, by2, px2, py2 = ax*kx, ay*ky, bx*kx, by*ky, px*kx, py*ky
@@ -563,10 +507,6 @@ def _project_to_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[f
     return proj, t, dist_m
 
 def _nearest_point_on_way(p: Tuple[float,float], way_coords: List[List[float]]) -> Tuple[int, float, Tuple[float,float], float]:
-    """
-    ウェイ上の最短射影点を求める。
-    戻り値 = (seg_index, t_in_seg[0..1], projLonLat, dist_m)
-    """
     best = (0, 0.0, tuple(way_coords[0]), float("inf"))
     for i in range(len(way_coords)-1):
         a = tuple(way_coords[i]); b = tuple(way_coords[i+1])
@@ -576,30 +516,19 @@ def _nearest_point_on_way(p: Tuple[float,float], way_coords: List[List[float]]) 
     return best
 
 def _subpath_centered_on(way_coords: List[List[float]], seg_idx: int, t: float, length_m: float) -> List[List[float]]:
-    """
-    ウェイの折れ線に沿って、指定射影点を中心に length_m のサブパスを抽出。
-    前後それぞれ half = length_m/2 ずつ辿る。
-    """
     if length_m <= 0:
-        # 点相当でもPathLayerは最低2点必要 → 1mだけ延ばす
         length_m = 1.0
     half = length_m / 2.0
-
-    # 射影点を明示的に頂点列へ差し込む（seg_idxとtから内分点）
     a = way_coords[seg_idx]; b = way_coords[seg_idx+1]
     ax, ay = a; bx, by = b
     proj = [ax + (bx-ax)*t, ay + (by-ay)*t]
 
-    # 後方へ half だけ辿る
     back_pts: List[List[float]] = [proj]
-    remain = half
-    i = seg_idx
-    cur = proj
+    remain = half; i = seg_idx; cur = proj
     while i >= 0 and remain > 0:
         prev = way_coords[i]
         d = _dist_m(tuple(cur), tuple(prev))
         if d >= remain:
-            # 内分点
             ratio = remain / d if d > 0 else 0
             x = cur[0] + (prev[0]-cur[0]) * ratio
             y = cur[1] + (prev[1]-cur[1]) * ratio
@@ -607,11 +536,8 @@ def _subpath_centered_on(way_coords: List[List[float]], seg_idx: int, t: float, 
         else:
             back_pts.append(prev); remain -= d; cur = prev; i -= 1
 
-    # 前方へ half だけ辿る
     fwd_pts: List[List[float]] = [proj]
-    remain = half
-    i = seg_idx + 1
-    cur = proj
+    remain = half; i = seg_idx + 1; cur = proj
     while i < len(way_coords) and remain > 0:
         nxt = way_coords[i]
         d = _dist_m(tuple(cur), tuple(nxt))
@@ -623,11 +549,8 @@ def _subpath_centered_on(way_coords: List[List[float]], seg_idx: int, t: float, 
         else:
             fwd_pts.append(nxt); remain -= d; cur = nxt; i += 1
 
-    # back（逆順）+ fwd（先）で中心を含むサブパス
     back_pts = back_pts[::-1]
-    # 中心点が重複するので fwd の先頭を落とす
     path = back_pts + fwd_pts[1:]
-    # 最低2点
     if len(path) < 2:
         path.append(path[0][:])
     return path
@@ -635,11 +558,6 @@ def _subpath_centered_on(way_coords: List[List[float]], seg_idx: int, t: float, 
 @st.cache_data(ttl=180)
 def build_snap_lines(j_points: List[Dict], ways: List[Dict],
                      base_min: int = 0, base_max: int = 10_000, thresh_m: int = 220) -> List[Dict]:
-    """
-    交通量に応じて線長を 0〜10,000m に自動調整（total*20 を 0..10km にクランプ）。
-    OSMウェイ上の最短射影点を中心に、そのウェイの折れ線に沿ったサブパスを抽出して描画。
-    道路が遠い/無い場合は東西短線（length_mに応じた長さ）でフェールセーフ。
-    """
     out: List[Dict] = []
     if not j_points: return out
     RED = [230, 0, 0, 235]
@@ -647,11 +565,9 @@ def build_snap_lines(j_points: List[Dict], ways: List[Dict],
     for jp in j_points:
         lon, lat = jp["position"]; p = (lon, lat)
         total = int(jp.get("total", jp.get("jt_total", 0)))
-        # 0〜10km スケーリング（50台/5分→1km、500台→上限10km）
-        length_m = max(base_min, min(base_max, total * 20.0))
+        length_m = max(base_min, min(base_max, total * 20.0))  # 0〜10km
 
-        # 近傍ウェイ探索
-        best = None  # (dist_m, way_idx, seg_idx, t, projLonLat)
+        best = None
         for wi, way in enumerate(ways):
             coords = way["coords"]
             seg_idx, t, proj, d = _nearest_point_on_way(p, coords)
@@ -663,12 +579,10 @@ def build_snap_lines(j_points: List[Dict], ways: List[Dict],
             coords = ways[wi]["coords"]
             path = _subpath_centered_on(coords, seg_idx, t, length_m)
         else:
-            # フェールセーフ：東西線
             kx, _ = _meters_scale(lat)
             half = length_m / 2.0
             dx_deg = half / max(kx, 1e-6)
-            p1 = [lon - dx_deg, lat]
-            p2 = [lon + dx_deg, lat]
+            p1 = [lon - dx_deg, lat]; p2 = [lon + dx_deg, lat]
             path = [p1, p2]
 
         width_px = 5 + min(14, (total // 100))
@@ -681,118 +595,7 @@ def build_snap_lines(j_points: List[Dict], ways: List[Dict],
     return out
 
 # ----------------------------------------------------------------------------
-# ビルダー（地図・事故ポイント等）
-# ----------------------------------------------------------------------------
-def build_base_layers(map_choice:str, custom_tile:str) -> List[pdk.Layer]:
-    tile = TILESETS.get(map_choice, TILESETS["標準"])
-    layers: List[pdk.Layer] = [pdk.Layer(
-        "TileLayer", id=f"base-{map_choice}", data=tile["url"],
-        min_zoom=0, max_zoom=tile.get("max_zoom",18), tile_size=256, opacity=1.0, refinement="no-overlap"
-    )]
-    if custom_tile.strip():
-        layers.append(pdk.Layer("TileLayer", id="custom-overlay", data=custom_tile.strip(),
-                                min_zoom=0, max_zoom=22, tile_size=256, opacity=0.6, refinement="no-overlap"))
-    return layers
-
-def grid_color_range() -> List[List[int]]:
-    return [
-        [255, 180, 180, 60], [255, 140, 140, 90], [255, 100, 100, 120],
-        [230, 60, 60, 150], [200, 40, 40, 190], [180, 20, 20, 220],
-    ]
-
-def color_from_count_factory(max_count:int):
-    def _fn(c:int) -> List[int]:
-        t = max(0.0, min(1.0, (c-1) / max(1, max_count-1)))
-        if t < 0.5:
-            u = t/0.5; r = int(255*(1-u)+255*u); g = int(212*(1-u)+107*u); b = int(212*(1-u)+107*u)
-        else:
-            u = (t-0.5)/0.5; r = int(255*(1-u)+217*u); g = int(107*(1-u)+4*u); b = int(107*(1-u)+41*u)
-        return [r,g,b, 190 if c>=5 else 180]
-    return _fn
-
-def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> List[List[float]]:
-    out: List[List[float]] = []
-    r_earth = 6378137.0
-    dlat = radius_m / r_earth
-    dlon = radius_m / (r_earth * math.cos(math.radians(lat)))
-    for i in range(n):
-        ang = 2 * math.pi * i / n
-        lat_i = lat + math.degrees(dlat * math.sin(ang))
-        lon_i = lon + math.degrees(dlon * math.cos(math.radians(lat)))
-        out.append([lon_i, lat_i])
-    out.append(out[0])
-    return out
-
-def build_intersection_layers(hot_df: pd.DataFrame, is_3d: bool) -> List[pdk.Layer]:
-    if hot_df.empty: return []
-    if is_3d:
-        return [pdk.Layer("ColumnLayer", id="hot-columns", data=hot_df,
-                          get_position="position", get_elevation="elev", elevation_scale=1.0,
-                          radius=65, get_fill_color="rgba", pickable=True, extruded=True)]
-    return [pdk.Layer("HeatmapLayer", id="hot-heatmap", data=hot_df,
-                      get_position="position", get_weight="weight", radius_pixels=60,
-                      intensity=0.85, threshold=0.05, opacity=0.35, pickable=False)]
-
-def build_congestion_grid(df: pd.DataFrame, is_3d: bool) -> List[pdk.Layer]:
-    if is_3d or df.empty: return []
-    acc = df[df["category"]=="交通事故"].copy()
-    if acc.empty: return []
-    acc["position"] = acc.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
-    acc["weight"] = 1.0
-    return [pdk.Layer("GridLayer", id="congestion-grid", data=acc,
-                      get_position="position", get_weight="weight",
-                      cell_size=200, extruded=False, opacity=0.18, pickable=False, aggregation="SUM",
-                      colorRange=grid_color_range())]
-
-def spiderfy(clon: float, clat: float, n: int, base_px: int = 16, gap_px: int = 8) -> List[Tuple[float,float]]:
-    out = []; rpx = base_px
-    for k in range(n):
-        ang = math.radians(137.5 * k)
-        dx = rpx*math.cos(ang); dy = rpx*math.sin(ang)
-        dlon = dx / (111320 * math.cos(math.radians(clat))); dlat = dy / 110540
-        out.append((clon + dlon, clat + dlat)); rpx += gap_px
-    return out
-
-def build_points_labels_buffers(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], Dict]:
-    centers = cluster_points(df, ZOOM_LIKE)
-    points: List[Dict] = []; icon_fg: List[Dict] = []; mini_fg: List[Dict] = []; mini_bg: List[Dict] = []
-    features: List[Dict] = []
-    for c in centers:
-        cnt = c["count"]; clat, clon = c["lat"], c["lon"]
-        if cnt <= FANOUT_THRESHOLD:
-            offs = spiderfy(clon, clat, cnt)
-            for (lon, lat), row in zip(offs, c["rows"]):
-                sty = CAT_STYLE.get(row["category"], CAT_STYLE["その他"])
-                p = {
-                    "position":[lon,lat], "color":sty["color"], "radius":sty["radius"],
-                    "c":row["category"], "s":row.get("summary",""), "m":row.get("municipality",""),
-                    "pred":row.get("pred",""), "src":row.get("src", EHIME_POLICE_URL),
-                    "r":int(row.get("radius_m",600)), "ico":sty["icon"],
-                    "info_html": make_incident_info_html(
-                        row["category"], row.get("summary",""), row.get("municipality",""), row.get("pred","")
-                    ),
-                }
-                points.append(p)
-                icon_fg.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
-                if len(mini_fg) < MAX_LABELS:
-                    vtxt = (row.get("summary","")[:4])
-                    vtxt = "\n".join(list(vtxt))
-                    offset_px = int(-14*LABEL_SCALE)
-                    mini_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
-                    mini_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
-        else:
-            points.append({"position":[clon,clat],"color":[100,100,100,210],"radius":70,"c":"集中","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎",
-                           "info_html": make_incident_info_html("集中","周辺に多数","", "")})
-            icon_fg.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
-    for p in points:
-        if p.get("r",0) > 0:
-            lon, lat = p["position"]
-            features.append({"type":"Feature","geometry":{"type":"Polygon","coordinates":[circle_coords(lon, lat, int(p["r"]))]},"properties":{}})
-    geojson = {"type":"FeatureCollection","features": features}
-    return points, icon_fg, mini_fg, mini_bg, geojson
-
-# ----------------------------------------------------------------------------
-# パイプライン（速報→位置推定）
+# Pipeline: 県警速報→位置推定
 # ----------------------------------------------------------------------------
 with st.spinner("速報を取得中…"):
     html = fetch_ehime_html()
@@ -871,6 +674,35 @@ hot_df["rgba"] = hot_df["count"].apply(_cfc)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)
 
 # ----------------------------------------------------------------------------
+# ★ ここでJARTICを一度だけ取得 → ティッカーに利用、地図でも再利用（NameError回避）
+# ----------------------------------------------------------------------------
+gj_prefetch, tlabel_prefetch = fetch_jartic_5min(EHIME_BBOX)
+j_points_prefetch: List[Dict] = jartic_features_to_points(gj_prefetch, tlabel_prefetch) if (gj_prefetch and tlabel_prefetch) else []
+
+def build_ticker_items(incidents_df: pd.DataFrame, jpts: List[Dict], tlabel: Optional[str]) -> List[str]:
+    items: List[str] = []
+    for _, r in incidents_df.head(12).iterrows():
+        cat = r.get("category",""); muni = r.get("municipality","") or ""; s = r.get("summary","")
+        if s: items.append(f"{muni} {s}")
+    if jpts and tlabel:
+        top = sorted(jpts, key=lambda p: p.get("total",0), reverse=True)[:8]
+        for p in top:
+            total, up, down = p.get("total",0), p.get("up",0), p.get("down",0)
+            items.append(f"【交通量 {tlabel}】合計{total}台/5分（↑{up} / ↓{down}）")
+    return items
+
+def render_ticker_html(lines: List[str]) -> None:
+    if not lines: return
+    text = "　｜　".join(lines)
+    st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{text}</div></div>", unsafe_allow_html=True)
+
+# トップバー直下でティッカーを描画（NameErrorのない安全な順序）
+ticker_lines = build_ticker_items(df, j_points_prefetch, tlabel_prefetch)
+render_ticker_html(ticker_lines)
+# 必要なら自動更新（5分毎）
+st.autorefresh(interval=5*60*1000, key="ticker_refresh")
+
+# ----------------------------------------------------------------------------
 # Sidebar
 # ----------------------------------------------------------------------------
 with st.sidebar:
@@ -896,7 +728,7 @@ with st.sidebar:
     st.session_state.show_hotspots = st.checkbox("ヒートマップ / 3D柱 を表示",
                                                  value=bool(st.session_state.show_hotspots))
 
-    st.markdown("  ")  # 余白
+    st.markdown("  ")
     st.markdown("#### 地図タイル")
     map_choice = st.selectbox("地図スタイル", list(TILESETS.keys()),
                               index=list(TILESETS.keys()).index(st.session_state.map_choice))
@@ -912,12 +744,105 @@ col_map, col_feed = st.columns([7,5], gap="large")
 
 with col_map:
     is_3d = (mode_3d == "3D")
+
+    # ベース／ヒート／事故グリッド
+    def build_base_layers(map_choice:str, custom_tile:str) -> List[pdk.Layer]:
+        tile = TILESETS.get(map_choice, TILESETS["標準"])
+        layers: List[pdk.Layer] = [pdk.Layer(
+            "TileLayer", id=f"base-{map_choice}", data=tile["url"],
+            min_zoom=0, max_zoom=tile.get("max_zoom",18), tile_size=256, opacity=1.0, refinement="no-overlap"
+        )]
+        if custom_tile.strip():
+            layers.append(pdk.Layer("TileLayer", id="custom-overlay", data=custom_tile.strip(),
+                                    min_zoom=0, max_zoom=22, tile_size=256, opacity=0.6, refinement="no-overlap"))
+        return layers
+
+    def build_intersection_layers(hot_df: pd.DataFrame, is_3d: bool) -> List[pdk.Layer]:
+        if hot_df.empty or not st.session_state.show_hotspots: return []
+        if is_3d:
+            return [pdk.Layer("ColumnLayer", id="hot-columns", data=hot_df,
+                              get_position="position", get_elevation="elev", elevation_scale=1.0,
+                              radius=65, get_fill_color="rgba", pickable=True, extruded=True)]
+        return [pdk.Layer("HeatmapLayer", id="hot-heatmap", data=hot_df,
+                          get_position="position", get_weight="weight",
+                          radius_pixels=60, intensity=0.85, threshold=0.05, opacity=0.35)]
+
+    def build_congestion_grid(df: pd.DataFrame, is_3d: bool) -> List[pdk.Layer]:
+        if is_3d or df.empty: return []
+        acc = df[df["category"]=="交通事故"].copy()
+        if acc.empty: return []
+        acc["position"] = acc.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
+        acc["weight"] = 1.0
+        return [pdk.Layer("GridLayer", id="congestion-grid", data=acc,
+                          get_position="position", get_weight="weight",
+                          cell_size=200, extruded=False, opacity=0.18, pickable=False,
+                          colorRange=[
+                              [255,180,180,60],[255,140,140,90],[255,100,100,120],
+                              [230,60,60,150],[200,40,40,190],[180,20,20,220],
+                          ])]
+
+    # 事故点/ラベル/バッファ
+    def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> List[List[float]]:
+        out: List[List[float]] = []
+        r_earth = 6378137.0
+        dlat = radius_m / r_earth
+        dlon = radius_m / (r_earth * math.cos(math.radians(lat)))
+        for i in range(n):
+            ang = 2 * math.pi * i / n
+            lat_i = lat + math.degrees(dlat * math.sin(ang))
+            lon_i = lon + math.degrees(dlon * math.cos(math.radians(lat)))
+            out.append([lon_i, lat_i])
+        out.append(out[0]); return out
+
+    def spiderfy(clon: float, clat: float, n: int, base_px: int = 16, gap_px: int = 8) -> List[Tuple[float,float]]:
+        out = []; rpx = base_px
+        for k in range(n):
+            ang = math.radians(137.5 * k)
+            dx = rpx*math.cos(ang); dy = rpx*math.sin(ang)
+            dlon = dx / (111320 * math.cos(math.radians(clat))); dlat = dy / 110540
+            out.append((clon + dlon, clat + dlat)); rpx += gap_px
+        return out
+
+    def build_points_labels_buffers(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict], List[Dict], List[Dict], Dict]:
+        centers = cluster_points(df, ZOOM_LIKE)
+        points: List[Dict] = []; icon_fg: List[Dict] = []; mini_fg: List[Dict] = []; mini_bg: List[Dict] = []
+        features: List[Dict] = []
+        for c in centers:
+            cnt = c["count"]; clat, clon = c["lat"], c["lon"]
+            if cnt <= FANOUT_THRESHOLD:
+                offs = spiderfy(clon, clat, cnt)
+                for (lon, lat), row in zip(offs, c["rows"]):
+                    sty = CAT_STYLE.get(row["category"], CAT_STYLE["その他"])
+                    p = {
+                        "position":[lon,lat], "color":sty["color"], "radius":sty["radius"],
+                        "info_html": make_incident_info_html(
+                            row["category"], row.get("summary",""), row.get("municipality",""), row.get("pred","")
+                        ),
+                        "r":int(row.get("radius_m",600)),
+                    }
+                    points.append(p)
+                    icon_fg.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
+                    if len(mini_fg) < MAX_LABELS:
+                        vtxt = "\n".join(list(row.get("summary","")[:4]))
+                        offset_px = int(-14*LABEL_SCALE)
+                        mini_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
+                        mini_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
+            else:
+                points.append({
+                    "position":[clon,clat],"color":[100,100,100,210],"radius":70,
+                    "info_html": make_incident_info_html("集中","周辺に多数","", ""), "r":0
+                })
+                icon_fg.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
+        for p in points:
+            if p.get("r",0) > 0:
+                lon, lat = p["position"]
+                features.append({"type":"Feature","geometry":{"type":"Polygon","coordinates":[circle_coords(lon, lat, int(p["r"]))]},"properties":{}})
+        geojson = {"type":"FeatureCollection","features": features}
+        return points, icon_fg, mini_fg, mini_bg, geojson
+
     layers: List[pdk.Layer] = []
     layers += build_base_layers(st.session_state.map_choice, custom_tile)
-
-    if st.session_state.show_hotspots:
-        layers += build_intersection_layers(hot_df, is_3d)
-
+    layers += build_intersection_layers(hot_df, is_3d)
     layers += build_congestion_grid(df, is_3d)
 
     points, icon_labels, mini_fg, mini_bg, geojson = build_points_labels_buffers(df)
@@ -934,13 +859,9 @@ with col_map:
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
 
-    # --- JARTIC 5分値（点/線） ---
-    j_points: List[Dict] = []; ways: List[Dict] = []
-    gj, tlabel = (None, None)
-    if st.session_state.show_jartic_points or st.session_state.show_snap_lines:
-        gj, tlabel = fetch_jartic_5min(EHIME_BBOX)
-        if gj and tlabel:
-            j_points = jartic_features_to_points(gj, tlabel)
+    # --- JARTIC（prefetch済みデータを利用） ---
+    j_points = j_points_prefetch
+    tlabel  = tlabel_prefetch
 
     if st.session_state.show_jartic_points and j_points:
         pts_vis = [{
@@ -959,7 +880,7 @@ with col_map:
 
     if st.session_state.show_snap_lines and j_points:
         ways = fetch_osm_roads_overpass(EHIME_BBOX)
-        lines = build_snap_lines(j_points, ways)  # 0〜10km スケール&ウェイに沿う
+        lines = build_snap_lines(j_points, ways)
         if lines:
             layers.append(
                 pdk.Layer(
@@ -970,7 +891,6 @@ with col_map:
                 )
             )
 
-    # ▼ ツールチップは info_html のみ
     deck = pdk.Deck(
         layers=layers,
         initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON,
@@ -984,14 +904,13 @@ with col_map:
     )
     st.pydeck_chart(deck, use_container_width=True, height=640)
 
-    # HUD
     st.markdown(
         "<div class='hud'><div class='hud-inner'>"
         f"<div class='badge'>Zoom: {init_zoom}（初期）</div>"
         "</div></div>", unsafe_allow_html=True
     )
 
-    # 凡例（カテゴリ＋JARTIC）
+    # 凡例
     legend_items = []
     for k, v in CAT_STYLE.items():
         rgba = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
