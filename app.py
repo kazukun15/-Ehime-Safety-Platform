@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム v9.9-A4
-# - ツールチップを {info_html} のみに統一（未展開の {c}{s}{m}{pred} を排除）
-# - JARTIC 点・線ホバー：時刻（JST）・合計・上り・下り
-# - 擬似渋滞線の長さを 30m〜10000m に動的拡張（交通量に応じて）
-# - 既存機能維持：速報→位置推定、交差点ヒート/3D柱 ON/OFF、JARTIC 点、擬似線、フェールセーフ、フィード 等
-
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
