@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v7.3.1
-# - 修正: Nominatim不達時でも市町中心へ確実に落とすための「内蔵ガゼッティア」追加
-# - 改善: ダーク/ライト両対応で視認性の高い配色（カテゴリ色を再調整）
-# - 仕様: v7.3（期間/地図タイル/2D-3D切替・将来バッファ拡大）を踏襲
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v8.0
+# - 追加: Gemini 2.5 Flash による事案テキスト→地名候補抽出（無料タイル/キー無しでも動作、キーがあれば精度向上）
+# - 強化: ガゼッティア（外部CSV + 内蔵市町中心）を用いたジオコーディングの堅牢化
+# - 踏襲: 無料地図選択（GSI/OSM/HOT/OpenTopo）・2D/3D 切替・将来バッファ拡大・クラスタ/凡例/フィード
 
-import os, re, math, time, sqlite3, threading, unicodedata
+import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
-import httpx, requests
+import httpx
+import requests
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
@@ -18,9 +19,16 @@ from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
 import h3
 
+# === Gemini (任意) ===
+try:
+    import google.generativeai as genai  # requirements: google-generativeai
+    _HAS_GEMINI = True
+except Exception:
+    _HAS_GEMINI = False
+
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/7.3.1 (builtin-gazetteer)"
+USER_AGENT = "ESP/8.0 (gemini+gazetteer)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -37,36 +45,21 @@ FANOUT_THRESHOLD = 4
 LABEL_SCALE = 1.0
 MAX_LABELS = 400
 
-# 市町名（検出用）に宇和島市・八幡浜市も拡張
 CITY_NAMES = [
     "松山市","今治市","新居浜市","西条市","大洲市","伊予市","四国中央市",
     "西予市","東温市","上島町","久万高原町","松前町","砥部町","内子町",
     "伊方町","松野町","鬼北町","愛南町","宇和島市","八幡浜市"
 ]
 
-# 内蔵・市町中心（近似・参考値）
-# 失敗時でも各市町へ必ず落とすためのミニガゼッティア（緯度経度は概ねの中心）
+# 内蔵市町中心（確実に市町へ落とす）
 MUNI_CENTERS = {
-    "松山市":      (132.7650, 33.8390),
-    "今治市":      (133.0000, 34.0660),
-    "新居浜市":    (133.2830, 33.9600),
-    "西条市":      (133.1830, 33.9180),
-    "大洲市":      (132.5500, 33.5000),
-    "伊予市":      (132.7010, 33.7550),
-    "四国中央市":  (133.5500, 33.9800),
-    "西予市":      (132.5000, 33.3660),
-    "東温市":      (132.8710, 33.7930),
-    "上島町":      (133.2000, 34.2600),
-    "久万高原町":  (132.9040, 33.5380),
-    "松前町":      (132.7110, 33.7870),
-    "砥部町":      (132.7870, 33.7350),
-    "内子町":      (132.6580, 33.5360),
-    "伊方町":      (132.3560, 33.4880),
-    "松野町":      (132.7570, 33.2260),
-    "鬼北町":      (132.8800, 33.2280),
-    "愛南町":      (132.5660, 33.0000),
-    "宇和島市":    (132.5600, 33.2230),
-    "八幡浜市":    (132.4230, 33.4620),
+    "松山市":(132.7650,33.8390),"今治市":(133.0000,34.0660),"新居浜市":(133.2830,33.9600),
+    "西条市":(133.1830,33.9180),"大洲市":(132.5500,33.5000),"伊予市":(132.7010,33.7550),
+    "四国中央市":(133.5500,33.9800),"西予市":(132.5000,33.3660),"東温市":(132.8710,33.7930),
+    "上島町":(133.2000,34.2600),"久万高原町":(132.9040,33.5380),"松前町":(132.7110,33.7870),
+    "砥部町":(132.7870,33.7350),"内子町":(132.6580,33.5360),"伊方町":(132.3560,33.4880),
+    "松野町":(132.7570,33.2260),"鬼北町":(132.8800,33.2280),"愛南町":(132.5660,33.0000),
+    "宇和島市":(132.5600,33.2230),"八幡浜市":(132.4230,33.4620),
 }
 
 CATEGORY_PATTERNS = [
@@ -77,31 +70,18 @@ CATEGORY_PATTERNS = [
     ("詐欺",     r"詐欺|還付金|投資詐欺|特殊詐欺"),
     ("事件",     r"威力業務妨害|条例違反|暴行|傷害|脅迫|器物損壊|青少年保護"),
 ]
-FACILITY_HINT = ["学校","小学校","中学校","高校","大学","グラウンド","体育館","公園","駅","港","病院","交差点"]
 
 # ===== UIテーマ =====
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 st.markdown(
     """
     <style>
-      :root{
-        --bg:#0b0f14; --panel:#0f141b; --panel2:#121924;
-        --text:#e8f1ff; --muted:#8aa0b6; --border:#2b3a4d;
-        --a:#007aff; --b:#00b894;
-      }
-      @media (prefers-color-scheme: light){
-        :root{
-          --bg:#f7fafc; --panel:#ffffff; --panel2:#f1f5f9;
-          --text:#0f2230; --muted:#586b7a; --border:#dfe7ef;
-          --a:#005acb; --b:#009a7a;
-        }
-      }
+      :root{ --bg:#0b0f14; --panel:#0f141b; --panel2:#121924; --text:#e8f1ff; --muted:#8aa0b6; --border:#2b3a4d; --a:#007aff; --b:#00b894; }
+      @media (prefers-color-scheme: light){ :root{ --bg:#f7fafc; --panel:#ffffff; --panel2:#f1f5f9; --text:#0f2230; --muted:#586b7a; --border:#dfe7ef; --a:#005acb; --b:#009a7a; } }
       html, body, .stApp { background: var(--bg); color: var(--text); }
-      .topbar{ position: sticky; top:0; z-index:10; padding:14px 16px; margin:-16px -16px 14px -16px;
-               border-bottom:1px solid var(--border); background:var(--panel); }
+      .topbar{ position: sticky; top:0; z-index:10; padding:14px 16px; margin:-16px -16px 14px -16px; border-bottom:1px solid var(--border); background:var(--panel); }
       .brand{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:1.05rem; }
-      .brand .id{ width:28px; height:28px; border-radius:8px; display:grid; place-items:center;
-                  background: linear-gradient(135deg,var(--a),var(--b)); color:#00131a; font-weight:900; }
+      .brand .id{ width:28px; height:28px; border-radius:8px; display:grid; place-items:center; background: linear-gradient(135deg,var(--a),var(--b)); color:#00131a; font-weight:900; }
       .subnote{ color: var(--muted); font-size:.85rem; margin-top:4px}
       .panel { background: var(--panel); border:1px solid var(--border); border-radius: 14px; padding: 10px 12px; }
       .legend { font-size:.95rem; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 12px;}
@@ -154,16 +134,18 @@ def get_sqlite():
     conn = sqlite3.connect("data/esp_cache.sqlite", check_same_thread=False)
     with conn:
         conn.execute("CREATE TABLE IF NOT EXISTS geocode_cache(key TEXT PRIMARY KEY, lon REAL, lat REAL, type TEXT, created_at TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS llm_cache(key TEXT PRIMARY KEY, json TEXT, created_at TEXT)")
     return conn
 conn = get_sqlite(); conn_lock = threading.Lock()
-def geocode_cache_get(key:str):
+
+def cache_get(table:str, key:str) -> Optional[str]:
     with conn_lock:
-        r = conn.execute("SELECT lon,lat,type FROM geocode_cache WHERE key=?", (key,)).fetchone()
-    if r: return float(r[0]), float(r[1]), str(r[2])
-    return None
-def geocode_cache_put(key:str, lon:float, lat:float, typ:str):
+        row = conn.execute(f"SELECT json FROM {table} WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+def cache_put(table:str, key:str, payload:str):
     with conn_lock, conn:
-        conn.execute("INSERT OR REPLACE INTO geocode_cache VALUES (?,?,?,?,datetime('now'))", (key, lon, lat, typ))
+        conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,datetime('now'))", (key, payload))
 
 # ===== Helpers =====
 def _norm(s: str) -> str:
@@ -276,7 +258,7 @@ class GazetteerIndex:
             r = self.df.iloc[hit[2]]; return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
         return None
 
-# ===== Nominatim（任意・失敗時は内蔵市町へ） =====
+# ===== Nominatim =====
 def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[float,float]]:
     try:
         q = f"{name} {municipality or ''} 愛媛県 日本".strip()
@@ -294,15 +276,63 @@ def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[fl
     except Exception:
         return None
 
+# ===== Gemini 解析（任意、APIキーがあれば使用） =====
+def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not (_HAS_GEMINI and api_key):
+        return []
+    # キャッシュ
+    key_src = f"gem8|{muni_hint or ''}|{full_text}"
+    key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
+    cached = cache_get("llm_cache", key)
+    if cached:
+        try:
+            obj = json.loads(cached)
+            return obj.get("candidates", []) if isinstance(obj, dict) else []
+        except Exception:
+            pass
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        system = (
+            "あなたは日本のガゼッティア補助エージェントです。"
+            "入力の事件・事故テキストから、地名や施設名候補を高精度で抽出します。"
+            "出力は次のJSONのみ: {\"candidates\":[{\"name\":str,\"kind\":str,\"confidence\":0..1}]}"
+            "kindは facility/street/intersection/town/city/unknown のいずれか。"
+            "文章内の固有の地物に限定し、あいまいなら市町でよい。最大5件まで。"
+        )
+        muni_line = f"市町ヒント: {muni_hint}\n" if muni_hint else ""
+        prompt = (
+            f"{system}\n\nテキスト:\n{full_text}\n\n{muni_line}"
+            "JSONのみで応答してください。追加説明は不要です。"
+        )
+        resp = model.generate_content(prompt)
+        txt = resp.text if hasattr(resp, "text") else str(resp)
+        # JSON抽出
+        start = txt.find("{"); end = txt.rfind("}")
+        if start >=0 and end>start:
+            txt = txt[start:end+1]
+        obj = json.loads(txt)
+        if isinstance(obj, dict):
+            cache_put("llm_cache", key, json.dumps(obj, ensure_ascii=False))
+            return obj.get("candidates", [])
+    except Exception:
+        return []
+    return []
+
 # ===== H3/Cluster =====
 def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
     if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)  # v3
     return h3.latlng_to_cell(lat, lon, res)  # v4
+
 def h3_latlng_from_cell(cell: str) -> Tuple[float,float]:
     if hasattr(h3, "h3_to_geo"): lat, lon = h3.h3_to_geo(cell); return lat, lon  # v3
     lat, lon = h3.cell_to_latlng(cell); return lat, lon  # v4
+
 def h3_res_from_zoom(zoom_val:int) -> int:
     return {7:5,8:6,9:7,10:8,11:9,12:9,13:10,14:10}.get(zoom_val, 8)
+
 def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
     res = h3_res_from_zoom(zoom_val)
     groups: Dict[str, List[Dict]] = {}
@@ -321,6 +351,7 @@ def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
 def short_summary(s: str, max_len: int = 64) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
     return (s[:max_len] + ("…" if len(s) > max_len else "")) if s else ""
+
 def make_prediction(category:str, muni:Optional[str]) -> str:
     if category == "詐欺":       return "SNSや投資の誘いに注意。送金前に家族や警察へ相談。"
     if category == "交通事故":   return "夕方や雨天の交差点で増えやすい。横断と右左折に注意。"
@@ -339,45 +370,55 @@ extracted: List[Dict] = []
 for it in raw_items:
     ex = rule_extract(it)
     ex["heading"] = it.heading
+    ex["full_text"] = (it.heading + " " + it.body).strip()
     extracted.append(ex)
 
 # 外部ガゼッティア（任意）
 gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
-# ---- 座標決定順序（堅牢化）----
-# 1) 外部ガゼッティア
-# 2) 内蔵市町中心（MUNI_CENTERS）
-# 3) Nominatim（施設→市町）
-# 4) 最終フォールバック：県庁
+# ---- 座標決定順序（Gemini + ガゼッティア + 内蔵 + Nominatim + 県庁） ----
+# 1) Geminiが提案する候補（施設/交差点/町名）
+# 2) 外部ガゼッティア（候補名→一致/ファジー）
+# 3) 内蔵市町中心
+# 4) Nominatim（施設→市町）
+# 5) 県庁
+
+def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
+    if not idx: return None
+    hit = idx.search(name, min_score)
+    return hit
+
 def resolve_one(ex: Dict) -> Dict:
     muni = ex.get("municipality"); places = ex.get("place_strings") or []
+    full_text = ex.get("full_text", "")
 
-    # 1) 外部ガゼッティア
-    if idx is not None:
-        for ptxt in places:
-            hit = idx.search(ptxt, 78)
-            if hit: lon, lat, typ = hit; return {"lon":lon, "lat":lat, "type":typ}
-        if muni:
-            hit = idx.search(muni, 78)
-            if hit: lon, lat, typ = hit; return {"lon":lon, "lat":lat, "type":typ}
+    # 1) Gemini 候補抽出
+    llm_cands = gemini_candidates(full_text, muni)
+    cand_names = [c.get("name","") for c in llm_cands if isinstance(c, dict)]
 
-    # 2) 内蔵市町中心（まずこれで確実に市町へ落とす）
+    # 優先順: Gemini候補 → ルール抽出のplace_strings → 市町
+    queries = [q for q in cand_names if q] + places + ([muni] if muni else [])
+
+    # 2) 外部ガゼッティア
+    for q in queries:
+        hit = try_gazetteer(q, 78)
+        if hit:
+            lon, lat, typ = hit
+            return {"lon":lon, "lat":lat, "type":typ or "facility"}
+
+    # 3) 内蔵市町中心
     if muni and muni in MUNI_CENTERS:
         lon, lat = MUNI_CENTERS[muni]
         return {"lon":lon, "lat":lat, "type":"city"}
 
-    # 3) Nominatim（任意・成功すれば上書き精度アップ）
-    if muni:
-        # 施設優先
-        for ptxt in places:
-            ll = nominatim_geocode(ptxt, muni)
-            if ll: return {"lon":ll[0], "lat":ll[1], "type":"facility"}
-        # 市町センター
-        ll = nominatim_geocode(muni, None)
-        if ll: return {"lon":ll[0], "lat":ll[1], "type":"city"}
+    # 4) Nominatim
+    for q in queries:
+        ll = nominatim_geocode(q, muni)
+        if ll:
+            return {"lon":ll[0], "lat":ll[1], "type":"facility"}
 
-    # 4) 県庁
+    # 5) 県庁
     return {"lon":EHIME_PREF_LON, "lat":EHIME_PREF_LAT, "type":"pref"}
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exctr:
@@ -400,8 +441,7 @@ for ex, loc in zip(extracted, results):
 
 df = pd.DataFrame(rows)
 
-# ===== カテゴリ色（ライト/ダーク両対応・高コントラスト） =====
-# 背景が暗い時も明るい時も埋もれにくい色を選択（彩度を抑え目＋輝度差を確保）
+# ===== カテゴリ色（ライト/ダーク両対応） =====
 CAT_STYLE = {
     "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
     "火災":     {"color":[245, 130, 50, 235],  "radius":88, "icon":"🔥"},
@@ -460,7 +500,8 @@ for c in centers:
             mini_labels_bg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[0,0,0,220],"offset":[0,-12]})
             mini_labels_fg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[255,255,255,235],"offset":[0,-12]})
 
-# === 近似円 ===
+# 近似円
+
 def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
     coords = []
     r_earth = 6378137.0
@@ -495,7 +536,7 @@ with col_map:
     is_3d = (mode_3d == "3D")
     hex_layer = pdk.Layer(
         "HexagonLayer",
-        data=[{"position":x["position"],"count":x["count"]} for x in [{"position":[c["lon"],c["lat"]],"count":c["count"]} for c in centers]],
+        data=[{"position":x["position"],"count":x["count"]} for x in hex_points],
         get_position="position",
         get_elevation_weight="count",
         elevation_scale=10 if is_3d else 5,
@@ -529,9 +570,7 @@ with col_map:
                   "borderRadius":"12px","border":"1px solid var(--border)"}
     }
 
-    initial_view = pdk.ViewState(
-        latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9, pitch=(45 if is_3d else 0), bearing=0
-    )
+    initial_view = pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9, pitch=(45 if is_3d else 0), bearing=0)
     deck = pdk.Deck(layers=layers, initial_view_state=initial_view, tooltip=tooltip, map_provider=None, map_style=None)
     st.pydeck_chart(deck, use_container_width=True, height=560)
 
