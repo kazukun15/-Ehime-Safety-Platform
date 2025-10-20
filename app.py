@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v8.2
-# - Fix: 未終了文字列（SyntaxError）修正、変数の二重定義/参照揺れを整理
-# - Update: 交差点ヒートマップの透明度を上げて道路が見えるように (opacity=0.35)
-# - Keep: 2D/3D切替、無料タイル、Gemini任意、ガゼッティア/Nominatim、将来バッファ、凡例、速報フィード
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.0
+# - 新規: 交差点ヒートマップの上に GridLayer を重ね、ホバーで件数（colorValue）を表示（2D）
+# - 新規: 無料の推定渋滞レイヤ（交通事故の密度）を GridLayer で追加（2D）
+# - 既存維持: 3DはColumnLayerのピッキングで件数表示 / Gemini任意 / ガゼッティア / Nominatim /
+#             無料タイル選択 / 2D/3D切替 / 将来バッファ / 凡例 / 速報フィード
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ except Exception:
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/8.2 (gemini+gazetteer+hotspots)"
+USER_AGENT = "ESP/9.0 (heatmap+grid counts + congestion)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -37,10 +38,7 @@ MAX_WORKERS = 6
 EHIME_PREF_LAT = 33.8390
 EHIME_PREF_LON = 132.7650
 
-# 将来影響を考慮した概位置バッファ倍率
 FUTURE_BUFFER_SCALE = 1.8
-
-# 内部既定
 ZOOM_LIKE = 10
 FANOUT_THRESHOLD = 4
 LABEL_SCALE = 1.0
@@ -52,7 +50,6 @@ CITY_NAMES = [
     "伊方町","松野町","鬼北町","愛南町","宇和島市","八幡浜市"
 ]
 
-# 内蔵市町中心（確実に市町へ落とす）
 MUNI_CENTERS = {
     "松山市":(132.7650,33.8390),"今治市":(133.0000,34.0660),"新居浜市":(133.2830,33.9600),
     "西条市":(133.1830,33.9180),"大洲市":(132.5500,33.5000),"伊予市":(132.7010,33.7550),
@@ -128,6 +125,15 @@ with st.sidebar:
 
     st.markdown("#### 表示モード")
     mode_3d = st.radio("2D / 3D", ["2D","3D"], horizontal=True, index=0)
+
+    st.markdown("#### レイヤ切替（2D時）")
+    show_intersections_heat = st.checkbox("交差点ヒートマップ（見た目）", True)
+    show_intersections_grid  = st.checkbox("交差点件数（ホバー表示）", True)
+    show_congestion_grid     = st.checkbox("推定渋滞（事故密度）", True)
+
+    st.markdown("#### 任意タイルURL（透過PNG推奨）")
+    custom_tile = st.text_input("例: https://…/{z}/{x}/{y}.png", "")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ===== SQLite cache =====
@@ -281,12 +287,11 @@ def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[fl
     except Exception:
         return None
 
-# ===== Gemini 解析（任意、APIキーがあれば使用） =====
+# ===== Gemini 解析（任意） =====
 def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not (_HAS_GEMINI and api_key):
         return []
-    # キャッシュ
     key_src = f"gem8|{muni_hint or ''}|{full_text}"
     key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
     cached = cache_get("llm_cache", key)
@@ -302,19 +307,13 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
         model = genai.GenerativeModel("gemini-2.5-flash")
         system = (
             "あなたは日本のガゼッティア補助エージェントです。"
-            "入力の事件・事故テキストから、地名や施設名候補を高精度で抽出します。"
-            "出力は次のJSONのみ: {\"candidates\":[{\"name\":str,\"kind\":str,\"confidence\":0..1}]}"
-            "kindは facility/street/intersection/town/city/unknown のいずれか。"
-            "文章内の固有の地物に限定し、あいまいなら市町でよい。最大5件まで。"
+            "入力の事件・事故テキストから、地名や施設名候補を抽出します。"
+            "出力は {\"candidates\":[{\"name\":str,\"kind\":str,\"confidence\":0..1}]}"
         )
         muni_line = f"市町ヒント: {muni_hint}\n" if muni_hint else ""
-        prompt = (
-            f"{system}\n\nテキスト:\n{full_text}\n\n{muni_line}"
-            "JSONのみで応答してください。追加説明は不要です。"
-        )
+        prompt = f"{system}\n\nテキスト:\n{full_text}\n\n{muni_line}JSONのみで応答。"
         resp = model.generate_content(prompt)
         txt = resp.text if hasattr(resp, "text") else str(resp)
-        # JSON抽出
         start = txt.find("{"); end = txt.rfind("}")
         if start >=0 and end>start:
             txt = txt[start:end+1]
@@ -378,50 +377,36 @@ for it in raw_items:
     ex["full_text"] = (it.heading + " " + it.body).strip()
     extracted.append(ex)
 
-# 外部ガゼッティア（任意）
+# Gazetteer（任意）
 gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
-# ---- 座標決定順序（Gemini + ガゼッティア + 内蔵 + Nominatim + 県庁） ----
 def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
     if not idx: return None
-    hit = idx.search(name, min_score)
-    return hit
+    return idx.search(name, min_score)
 
-def resolve_one(ex: Dict) -> Dict:
+def nominatim_best(ex: Dict) -> Dict:
     muni = ex.get("municipality"); places = ex.get("place_strings") or []
     full_text = ex.get("full_text", "")
-
-    # 1) Gemini 候補抽出
     llm_cands = gemini_candidates(full_text, muni)
     cand_names = [c.get("name","") for c in llm_cands if isinstance(c, dict)]
-
-    # 優先順: Gemini候補 → ルール抽出のplace_strings → 市町
     queries = [q for q in cand_names if q] + places + ([muni] if muni else [])
-
-    # 2) 外部ガゼッティア
     for q in queries:
         hit = try_gazetteer(q, 78)
         if hit:
             lon, lat, typ = hit
             return {"lon":lon, "lat":lat, "type":typ or "facility"}
-
-    # 3) 内蔵市町中心
     if muni and muni in MUNI_CENTERS:
         lon, lat = MUNI_CENTERS[muni]
         return {"lon":lon, "lat":lat, "type":"city"}
-
-    # 4) Nominatim
     for q in queries:
         ll = nominatim_geocode(q, muni)
         if ll:
             return {"lon":ll[0], "lat":ll[1], "type":"facility"}
-
-    # 5) 県庁
     return {"lon":EHIME_PREF_LON, "lat":EHIME_PREF_LAT, "type":"pref"}
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exctr:
-    results = list(exctr.map(resolve_one, extracted))
+    results = list(exctr.map(nominatim_best, extracted))
 
 rows: List[Dict] = []
 for ex, loc in zip(extracted, results):
@@ -457,6 +442,8 @@ hot_df["lat"] = hot_df["lat"].astype(float)
 hot_df["lon"] = hot_df["lon"].astype(float)
 hot_df["count"] = hot_df["count"].astype(int)
 max_count = int(hot_df["count"].max()) if not hot_df.empty else 1
+hot_df["position"] = hot_df.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
+hot_df["weight"] = hot_df["count"].astype(float)
 
 def color_from_count(c:int) -> List[int]:
     # 低: #ffd4d4 → 中: #ff6b6b → 高: #d90429 （アルファ 180-200）
@@ -476,8 +463,6 @@ def color_from_count(c:int) -> List[int]:
 
 hot_df["rgba"] = hot_df["count"].apply(color_from_count)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)  # 3D柱の高さ
-hot_df["position"] = hot_df.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
-hot_df["weight"] = hot_df["count"].astype(float)
 
 # ===== カテゴリ色（ライト/ダーク両対応） =====
 CAT_STYLE = {
@@ -527,7 +512,7 @@ for c in centers:
             icon_labels.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
             if len(mini_labels_fg) < MAX_LABELS:
                 vtxt = (row["summary"] or "")[:4]
-                vtxt = "\n".join(list(vtxt))  # ★ 縦並び表示（SyntaxError修正）
+                vtxt = "\n".join(list(vtxt))  # 縦並び表示
                 offset_px = int(-14*LABEL_SCALE)
                 mini_labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
                 mini_labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
@@ -539,7 +524,7 @@ for c in centers:
             mini_labels_bg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[0,0,0,220],"offset":[0,-12]})
             mini_labels_fg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[255,255,255,235],"offset":[0,-12]})
 
-# 近似円
+# 円（概位置バッファ）
 def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
     coords = []
     r_earth = 6378137.0
@@ -573,34 +558,82 @@ with col_map:
 
     is_3d = (mode_3d == "3D")
 
-    # 交差点ホットスポット（透明度強め）
+    # 2D: 交差点ヒートマップ（見た目）＋ GridLayer（ホバー件数）
+    intersection_layers = []
     if not hot_df.empty:
         if is_3d:
-            hotspot_layer = pdk.Layer(
-                "ColumnLayer",
-                data=hot_df,
-                get_position="position",
-                get_elevation="elev",
-                elevation_scale=1.0,
-                radius=65,
-                get_fill_color="rgba",  # 半透明RGBA
-                pickable=True,
-                extruded=True,
+            # 3Dは押し出し柱で件数をダイレクトにピック
+            intersection_layers.append(
+                pdk.Layer(
+                    "ColumnLayer",
+                    data=hot_df,
+                    get_position="position",
+                    get_elevation="elev",
+                    elevation_scale=1.0,
+                    radius=65,
+                    get_fill_color="rgba",
+                    pickable=True,
+                    extruded=True,
+                )
             )
         else:
-            hotspot_layer = pdk.Layer(
-                "HeatmapLayer",
-                data=hot_df,
+            if show_intersections_heat:
+                intersection_layers.append(
+                    pdk.Layer(
+                        "HeatmapLayer",
+                        data=hot_df,
+                        get_position="position",
+                        get_weight="weight",     # countを重みとして使用
+                        radius_pixels=60,
+                        intensity=0.85,
+                        threshold=0.05,
+                        opacity=0.35             # 道路が見える透明度
+                    )
+                )
+            if show_intersections_grid:
+                # ほぼ透明のグリッド（情報レイヤ）でホバー時に colorValue（合計件数）を表示
+                intersection_layers.append(
+                    pdk.Layer(
+                        "GridLayer",
+                        data=hot_df,
+                        get_position="position",
+                        get_weight="weight",     # countをそのまま合算
+                        cell_size=160,           # メートル換算: 約160mグリッド
+                        extruded=False,
+                        opacity=0.01,            # ほぼ透明（見た目はHeatmapに任せる）
+                        pickable=True,
+                        aggregation="SUM"
+                    )
+                )
+
+    # 推定渋滞レイヤ（交通事故の密度）: dfから交通事故のみ抽出しGridLayerで表示（2Dのみ）
+    congestion_layer = None
+    if (not df.empty) and (not is_3d) and show_congestion_grid:
+        acc = df[df["category"] == "交通事故"].copy()
+        if not acc.empty:
+            acc["position"] = acc.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
+            acc["weight"] = 1.0  # 件数=1をセル内で合算
+            congestion_layer = pdk.Layer(
+                "GridLayer",
+                data=acc,
                 get_position="position",
                 get_weight="weight",
-                radius_pixels=60,
-                intensity=0.85,
-                threshold=0.05,
-                opacity=0.35  # ★ 道路が見えるよう透明度UP
+                cell_size=200,       # 少し広め
+                extruded=False,
+                opacity=0.18,        # ヒート風の薄い赤で出す
+                pickable=True,
+                aggregation="SUM",
+                colorRange=[
+                    [255, 180, 180, 60],
+                    [255, 140, 140, 90],
+                    [255, 100, 100, 120],
+                    [230, 60, 60, 150],
+                    [200, 40, 40, 190],
+                    [180, 20, 20, 220],
+                ],
             )
-    else:
-        hotspot_layer = None
 
+    # 既存のHex/円/散布/ラベル
     hex_layer = pdk.Layer(
         "HexagonLayer",
         data=[{"position":[c["lon"],c["lat"]],"count":c["count"]} for c in centers],
@@ -618,8 +651,21 @@ with col_map:
     layers = [
         pdk.Layer("TileLayer", data=TILE["url"], min_zoom=0, max_zoom=TILE.get("max_zoom",18), tile_size=256, opacity=1.0),
     ]
-    if hotspot_layer: layers.append(hotspot_layer)
 
+    if custom_tile.strip():
+        layers.append(
+            pdk.Layer("TileLayer", data=custom_tile.strip(), min_zoom=0, max_zoom=22, tile_size=256, opacity=0.6)
+        )
+
+    # 交差点系
+    for L in intersection_layers:
+        layers.append(L)
+
+    # 推定渋滞（2D事故密度）
+    if congestion_layer is not None:
+        layers.append(congestion_layer)
+
+    # 既存の概位置・ポイント・ラベル
     layers += [
         hex_layer,
         pdk.Layer("GeoJsonLayer", data=geojson, pickable=False, stroked=True, filled=True,
@@ -634,18 +680,27 @@ with col_map:
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
 
-    tooltip = {
-        "html": "<b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/><a href='{src}' target='_blank'>出典</a>",
-        "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"280px","whiteSpace":"normal",
-                  "wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px",
-                  "borderRadius":"12px","border":"1px solid var(--border)"}
-    }
+    # ツールチップ
+    # - GridLayer: {colorValue} がセル内の合計重み（＝件数合計）として表示される
+    tooltip_html = """
+    <div style='min-width:180px'>
+      <b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/><a href='{src}' target='_blank'>出典</a>
+    </div>
+    """
+    deck = pdk.Deck(
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=11, pitch=(45 if is_3d else 0), bearing=0),
+        tooltip={
+            "html": tooltip_html,
+            "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"320px","whiteSpace":"normal",
+                      "wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px",
+                      "borderRadius":"12px","border":"1px solid var(--border)"}
+        },
+        map_provider=None, map_style=None
+    )
+    st.pydeck_chart(deck, use_container_width=True, height=620)
 
-    initial_view = pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=11, pitch=(45 if is_3d else 0), bearing=0)
-    deck = pdk.Deck(layers=layers, initial_view_state=initial_view, tooltip=tooltip, map_provider=None, map_style=None)
-    st.pydeck_chart(deck, use_container_width=True, height=600)
-
-    # 凡例（カテゴリ＋交差点強度）
+    # 凡例
     legend_items = []
     for k, v in CAT_STYLE.items():
         rgba = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
@@ -683,4 +738,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: GSI / OSM / OpenTopoMap（APIキー不要） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
+st.caption("地図: GSI / OSM / OpenTopoMap（APIキー不要） | 情報: 県警速報＋交差点CSV＋推定渋滞（事故密度）。緊急時は110・119へ。")
