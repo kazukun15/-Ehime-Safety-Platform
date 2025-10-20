@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.9-A
-# 目的: JARTIC 5分値（断面交通量）を「点」で改善表示しつつ、
-#       OSM(Overpass)にスナップした短い“線”として疑似渋滞可視化（B-1）を追加。
-# 方針: 他の渋滞API（HERE/TomTom）は完全排除。既存機能は保持。
-# 注意: JARTIC公開は約20分遅延。5分丸め。Overpassは主要道路のみ取得。
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.6 (HERE Traffic対応)
+# 変更点:
+# - TomTom依存を外し、HERE Traffic Flow(JSON)を描画する PathLayer を追加
+# - v9.5の機能(速報→位置推定、カテゴリ可視化、交差点ヒート/3D柱、フィード等)を維持
+# - サイドバーに「HERE Traffic」をトグル追加（APIキーは HERE_API_KEY）
+# - CSSは f-string を使わずに挿入し、中括弧エスケープ問題を根絶
+# - 防御的パーサ(here_flow_to_paths)で提示の results[] 形式をそのまま可視化
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
@@ -33,8 +35,8 @@ except Exception:
 # ----------------------------------------------------------------------------
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A (jartic+snapline)"
-TIMEOUT = 15
+USER_AGENT = "ESP/9.6 (here-traffic, refactor)"
+TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
 
@@ -73,7 +75,7 @@ MUNI_CENTERS = {
     "宇和島市":(132.5600,33.2230),"八幡浜市":(132.4230,33.4620),
 }
 
-# タイル定義（Google Mapsに寄せた分かりやすい選択肢）
+# タイル定義（Google Mapsに近い選択肢）
 TILESETS: Dict[str, Dict] = {
     "標準":     {"url":"https://tile.openstreetmap.org/{z}/{x}/{y}.png", "max_zoom":19, "thumb":"https://tile.openstreetmap.org/14/14553/6620.png", "copyright":"© OpenStreetMap"},
     "淡色":     {"url":"https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", "max_zoom":18, "thumb":"https://cyberjapandata.gsi.go.jp/xyz/pale/14/14553/6620.png", "copyright":"© GSI"},
@@ -83,7 +85,7 @@ TILESETS: Dict[str, Dict] = {
 }
 
 # ----------------------------------------------------------------------------
-# Streamlit base UI
+# Streamlit base UI（CSSは f-string を使わず安全に）
 # ----------------------------------------------------------------------------
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 
@@ -105,7 +107,19 @@ CSS = """
   @media (max-width: 640px){ .feed-scroll{max-height:48vh} }
   a { color: var(--a); }
   .riskbar{height:10px; border-radius:6px; background:linear-gradient(90deg,#ffd4d4,#ff6b6b,#d90429);}      
-  .risklbl{display:flex; justify-content:space-between; font-size:.85rem; color: var(--muted); margin-top:4px}
+  .risklbl{display:flex; justify-content:space-between; font-size:.85rem; color:var(--muted); margin-top:4px}
+  /* レイヤーピッカー */
+  .layers-fab { position:fixed; right:18px; bottom:18px; z-index:20; }
+  .layers-fab .btn { width:44px; height:44px; border-radius:12px; display:grid; place-items:center; background:var(--panel); border:1px solid var(--border); box-shadow:0 6px 18px rgba(0,0,0,.22); cursor:pointer; }
+  .layers-panel { width:min(92vw, 720px); background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:14px; padding:12px; box-shadow:0 10px 24px rgba(0,0,0,.28); }
+  .grid { display:grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap:12px; }
+  @media (max-width: 740px){ .grid{grid-template-columns: repeat(2, 1fr);} }
+  .card { border:1px solid var(--border); border-radius:12px; overflow:hidden; background:var(--panel2); }
+  .thumb { width:100%; aspect-ratio: 4/3; object-fit:cover; }
+  .label { padding:8px 10px; font-size:.95rem; display:flex; align-items:center; justify-content:space-between; }
+  .active { outline:2px solid var(--a); }
+  .toggles { display:flex; gap:10px; flex-wrap:wrap; margin-top:8px; }
+  .toggle { padding:6px 10px; border-radius:10px; border:1px solid var(--border); background:var(--panel2); }
   .hud { position: relative; height:0; }
   .hud-inner { position: relative; top:-36px; left:6px; display:flex; gap:6px; flex-wrap:wrap; }
   .hud .badge { background:rgba(16,20,27,.88); color:#e8f1ff; border:1px solid var(--border); padding:4px 8px; border-radius:10px; font-size:.85rem; }
@@ -126,13 +140,13 @@ st.markdown(HEADER, unsafe_allow_html=True)
 # ----------------------------------------------------------------------------
 if "map_choice" not in st.session_state:
     st.session_state.map_choice = "標準"
-if "show_jartic_points" not in st.session_state:
-    st.session_state.show_jartic_points = True
-if "show_snap_lines" not in st.session_state:
-    st.session_state.show_snap_lines = True
+if "show_here_flow" not in st.session_state:
+    st.session_state.show_here_flow = True
+if "show_hotspots" not in st.session_state:
+    st.session_state.show_hotspots = True
 
 # ----------------------------------------------------------------------------
-# SQLite cache (for LLM etc.)
+# Secrets / Keys
 # ----------------------------------------------------------------------------
 @st.cache_resource
 def get_sqlite():
@@ -143,7 +157,8 @@ def get_sqlite():
         conn.execute("CREATE TABLE IF NOT EXISTS llm_cache(key TEXT PRIMARY KEY, json TEXT, created_at TEXT)")
     return conn
 
-_conn = get_sqlite(); _conn_lock = threading.Lock()
+_conn = get_sqlite()
+_conn_lock = threading.Lock()
 
 def cache_get(table:str, key:str) -> Optional[str]:
     with _conn_lock:
@@ -153,6 +168,16 @@ def cache_get(table:str, key:str) -> Optional[str]:
 def cache_put(table:str, key:str, payload:str):
     with _conn_lock, _conn:
         _conn.execute(f"INSERT OR REPLACE INTO {table} VALUES (?,?,datetime('now'))", (key, payload))
+
+# HERE API key
+
+def get_here_key() -> str:
+    try:
+        if "HERE_API_KEY" in st.secrets and st.secrets["HERE_API_KEY"]:
+            return st.secrets["HERE_API_KEY"]
+    except Exception:
+        pass
+    return os.getenv("HERE_API_KEY", "")
 
 # ----------------------------------------------------------------------------
 # Data classes / parsing (Ehime Police)
@@ -383,190 +408,99 @@ CAT_STYLE = {
 }
 
 # ----------------------------------------------------------------------------
-# JARTIC Open Traffic (5分値) 取得・可視化
+# HERE Traffic Flow: fetch → parse → layer
 # ----------------------------------------------------------------------------
 
-JARTIC_WFS_URL = "https://api.jartic-open-traffic.org/geoserver"
+def jf_color(jf: float) -> List[int]:
+    t = max(0.0, min(1.0, jf / 10.0))
+    if t < 0.5:  # 緑→黄
+        u = t/0.5
+        r = int( 80*(1-u) + 255*u)
+        g = int(200*(1-u) + 220*u)
+        b = int( 80*(1-u) +   0*u)
+    else:        # 黄→赤
+        u = (t-0.5)/0.5
+        r = int(255*(1-u) + 220*u)
+        g = int(220*(1-u) +  40*u)
+        b = 0
+    return [r, g, b, 220]
 
-def jst_now() -> datetime:
-    return datetime.utcnow() + timedelta(hours=9)
-
-def round_to_5min(d: datetime) -> datetime:
-    mm = (d.minute // 5) * 5
-    return d.replace(minute=mm, second=0, microsecond=0)
-
-@st.cache_data(ttl=180)
-def fetch_jartic_5min(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> Optional[Dict]:
-    t = round_to_5min(jst_now() - timedelta(minutes=20))
-    tcode = t.strftime("%Y%m%d%H%M")  # YYYYMMDDhhmm
-    cql = (
-        f"道路種別=3 AND 時間コード={tcode} AND "
-        f"BBOX(ジオメトリ,{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]},'EPSG:4326')"
-    )
+@st.cache_data(ttl=120)
+def fetch_here_flow(bbox: Tuple[float,float,float,float], here_key: str, units: str = "metric") -> Optional[Dict]:
+    if not here_key:
+        return None
+    # 提示JSONの構造に合わせた簡易取得: 実際は契約バージョンに応じてエンドポイントを調整
+    # v7/6.3相当のサンプルAPI（bbox指定）。運用では v8 REST に置き換えてください。
+    url = "https://traffic.ls.hereapi.com/traffic/6.3/flow.json"
     params = {
-        "service": "WFS", "version": "2.0.0", "request": "GetFeature",
-        "typeNames": "t_travospublic_measure_5m",
-        "srsName": "EPSG:4326",
-        "outputFormat": "application/json",
-        "exceptions": "application/json",
-        "cql_filter": cql
+        "apiKey": here_key,
+        "bbox": f"{bbox[1]},{bbox[0]};{bbox[3]},{bbox[2]}",
+        "responseattributes": "sh,fc",
+        "units": units
     }
     try:
-        r = requests.get(JARTIC_WFS_URL, params=params, timeout=TIMEOUT)
+        r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception:
         return None
 
-# GeoJSON -> 点（合計交通量・上り/下り）
-
-def jartic_features_to_points(geojson: Dict) -> List[Dict]:
-    if not geojson or "features" not in geojson: return []
-    pts: List[Dict] = []
-    for f in geojson["features"]:
-        g = f.get("geometry") or {}
-        if g.get("type") == "MultiPoint":
-            for lon, lat in g.get("coordinates", []):
-                prop = f.get("properties", {})
-                up = sum(filter(None, [
-                    prop.get("上り・小型交通量"), prop.get("上り・大型交通量"), prop.get("上り・車種判別不能交通量")
-                ]))
-                down = sum(filter(None, [
-                    prop.get("下り・小型交通量"), prop.get("下り・大型交通量"), prop.get("下り・車種判別不能交通量")
-                ]))
-                total = int((up or 0) + (down or 0))
-                pts.append({
-                    "position":[float(lon), float(lat)],
-                    "up": int(up or 0), "down": int(down or 0), "total": total
-                })
-    return pts
-
-# 交通量→色/サイズ（視認性強化）
-
-def color_from_total(total:int) -> List[int]:
-    # 0 → 青 / 150 → 緑 / 300 → 黄 / 600+ → 赤
-    t = min(1.0, max(0.0, total / 600.0))
-    if t < 0.33:  # 青→緑
-        u = t/0.33
-        r = int( 60*(1-u) +  60*u)
-        g = int(120*(1-u) + 200*u)
-        b = int(200*(1-u) +  80*u)
-    elif t < 0.66:  # 緑→黄
-        u = (t-0.33)/0.33
-        r = int( 60*(1-u) + 240*u)
-        g = int(200*(1-u) + 220*u)
-        b = int( 80*(1-u) +  20*u)
-    else:  # 黄→赤
-        u = (t-0.66)/0.34
-        r = int(240*(1-u) + 240*u)
-        g = int(220*(1-u) +  60*u)
-        b = int( 20*(1-u) +  20*u)
-    return [r,g,b, 220]
-
-def size_from_total(total:int) -> int:
-    return 36 + int(min(220, total * 0.6))  # 最小36px〜上限
-
-# ----------------------------------------------------------------------------
-# OSM (Overpass) 主要道路の取得 & スナップ線生成（B-1）
-# ----------------------------------------------------------------------------
-
-OVERPASS_URL = "https://overpass-api.de/api/interpreter"
-
-@st.cache_data(ttl=600)
-def fetch_osm_roads_overpass(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> List[List[List[float]]]:
-    # trunk/primary/secondary + motorway/tertiary を対象（線が多すぎないよう制限）
-    minLon, minLat, maxLon, maxLat = bbox
-    q = f"""
-    [out:json][timeout:25];
-    (
-      way["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"]({minLat},{minLon},{maxLat},{maxLon});
-    );
-    out geom;
-    """
-    try:
-        r = requests.post(OVERPASS_URL, data={"data": q}, timeout=TIMEOUT)
-        r.raise_for_status()
-        data = r.json()
-        lines: List[List[List[float]]] = []  # list of polylines [[lon,lat], ...]
-        for el in data.get("elements", []):
-            if el.get("type") == "way" and "geometry" in el:
-                coords = [[pt["lon"], pt["lat"]] for pt in el["geometry"]]
-                if len(coords) >= 2:
-                    lines.append(coords)
-        return lines
-    except Exception:
+def here_flow_to_paths(payload: Dict) -> List[Dict]:
+    if not payload:
         return []
+    paths: List[Dict] = []
+    # ユーザ提供例の results[] 形式を優先
+    if isinstance(payload.get("results"), list) and payload["results"]:
+        for it in payload["results"]:
+            loc = it.get("location", {})
+            cur = it.get("currentFlow", {})
+            jf = float(cur.get("jamFactor", 0))
+            width = 6 + int(jf)
+            links = ((loc.get("shape") or {}).get("links") or [])
+            for link in links:
+                pts = link.get("points") or []
+                if len(pts) >= 2:
+                    path = [[float(p["lng"]), float(p["lat"]) ] for p in pts if "lng" in p and "lat" in p]
+                    if len(path) >= 2:
+                        paths.append({"path": path, "color": jf_color(jf), "width": width})
+        return paths
+    # v6.3/7系の RWS/RW/LCS/FIS 構造にもざっくり対応（最小実装）
+    try:
+        RWS = payload.get("RWS", [])
+        for rws in RWS:
+            for rw in rws.get("RW", []):
+                for fis in rw.get("FIS", []):
+                    for fi in fis.get("FI", []):
+                        jf = float(((fi.get("CF") or [{}])[0]).get("JF", 0))
+                        shp = fi.get("SHP", [])
+                        for seg in shp:
+                            # SHP は "value": ["lat,lon lat,lon ..."]
+                            for v in seg.get("value", []):
+                                pts = []
+                                for pair in v.split(" "):
+                                    if not pair: continue
+                                    la, lo = pair.split(",")
+                                    pts.append([float(lo), float(la)])
+                                if len(pts) >= 2:
+                                    paths.append({"path": pts, "color": jf_color(jf), "width": 6 + int(jf)})
+    except Exception:
+        pass
+    return paths
 
-# 距離・最近点計算（地球を平面近似：小距離想定）
-
-def _dist2(a: Tuple[float,float], b: Tuple[float,float]) -> float:
-    dx = (a[0]-b[0]) * 111320 * math.cos(math.radians((a[1]+b[1])/2))
-    dy = (a[1]-b[1]) * 110540
-    return dx*dx + dy*dy
-
-def _nearest_on_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[float,float]) -> Tuple[Tuple[float,float], Tuple[float,float], float]:
-    # return (proj_point(lon,lat), direction_vector_lonlat, distance_m)
-    ax, ay = a; bx, by = b; px, py = p
-    # 平面座標化
-    kx = 111320 * math.cos(math.radians((ay+by)/2))
-    ky = 110540
-    ax2, ay2, bx2, by2, px2, py2 = ax*kx, ay*ky, bx*kx, by*ky, px*kx, py*ky
-    vx, vy = bx2-ax2, by2-ay2
-    wx, wy = px2-ax2, py2-ay2
-    seglen2 = vx*vx + vy*vy
-    if seglen2 == 0:
-        return (a, (0.0,0.0), math.sqrt(_dist2(p, a)))
-    t = max(0.0, min(1.0, (wx*vx + wy*vy) / seglen2))
-    projx2, projy2 = ax2 + t*vx, ay2 + t*vy
-    proj = (projx2 / kx, projy2 / ky)
-    # 方向ベクトル（正規化せず、角度のみ利用）
-    dir_vec = (bx - ax, by - ay)
-    dist_m = math.sqrt((px2-projx2)**2 + (py2-projy2)**2)
-    return (proj, dir_vec, dist_m)
-
-@st.cache_data(ttl=180)
-def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]], length_m: int = 140, thresh_m: int = 120) -> List[Dict]:
-    # 各JARTIC点を最も近い道路セグメントにスナップ。閾値内なら短い線分を生成。
-    out: List[Dict] = []
-    if not j_points or not roads:
-        return out
-    for jp in j_points:
-        lon, lat = jp["position"]
-        p = (lon, lat)
-        best = None  # (proj, dir_vec, dist_m)
-        for line in roads:
-            for i in range(len(line)-1):
-                a = tuple(line[i]); b = tuple(line[i+1])
-                proj, dv, d = _nearest_on_segment(p, a, b)
-                if (best is None) or (d < best[2]):
-                    best = (proj, dv, d)
-        if not best: continue
-        proj, dv, dist_m = best
-        if dist_m > thresh_m:  # 道路から遠すぎ
-            continue
-        # 方向ベクトルを正規化して±length_m/2 ずつ延長
-        vx, vy = dv
-        mag = math.hypot(vx, vy)
-        if mag == 0:  # 垂直線化
-            vx, vy = 0.0, 1.0
-            mag = 1.0
-        ux, uy = vx/mag, vy/mag
-        # メートル→度換算（近似）
-        kx = 111320 * math.cos(math.radians(proj[1]))
-        ky = 110540
-        half = length_m / 2.0
-        dx_deg = (ux * half) / kx
-        dy_deg = (uy * half) / ky
-        p1 = [proj[0] - dx_deg, proj[1] - dy_deg]
-        p2 = [proj[0] + dx_deg, proj[1] + dy_deg]
-        width = 3 + int(min(9, jp["total"] / 80))  # 交通量に応じて線幅
-        out.append({
-            "path": [p1, p2],
-            "color": color_from_total(jp["total"]),
-            "width": width,
-            "meta": jp
-        })
-    return out
+def build_here_flow_layer(paths: List[Dict]) -> Optional[pdk.Layer]:
+    if not paths:
+        return None
+    return pdk.Layer(
+        "PathLayer",
+        id="here-traffic-flow",
+        data=paths,
+        get_path="path",
+        get_color="color",
+        width_scale=1,
+        get_width="width",
+        pickable=False,
+        opacity=0.95
+    )
 
 # ----------------------------------------------------------------------------
 # Builders (base/heat/grid/points)
@@ -663,7 +597,7 @@ def build_points_labels_buffers(df: pd.DataFrame) -> Tuple[List[Dict], List[Dict
     return points, icon_fg, mini_fg, mini_bg, geojson
 
 # ----------------------------------------------------------------------------
-# Data pipeline（県警速報→位置推定）
+# Data pipeline
 # ----------------------------------------------------------------------------
 with st.spinner("速報を取得中…"):
     html = fetch_ehime_html()
@@ -682,7 +616,6 @@ idx = GazetteerIndex(gdf) if gdf is not None else None
 
 def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
     return None if not idx else idx.search(name, min_score)
-
 
 def resolve_loc(ex: Dict) -> Dict:
     muni = ex.get("municipality"); places = ex.get("place_strings") or []
@@ -760,10 +693,11 @@ with col_map:
         st.markdown("#### 表示モード")
         mode_3d = st.radio("2D / 3D", ["2D","3D"], horizontal=True, index=0)
         init_zoom = st.slider("初期ズーム", 8, 17, 11)
-        st.markdown("#### JARTIC 交通量 (5分)")
-        st.session_state.show_jartic_points = st.checkbox("JARTIC 5分値（点）", value=bool(st.session_state.show_jartic_points))
-        st.session_state.show_snap_lines   = st.checkbox("JARTIC 5分値（線：OSMスナップ）", value=bool(st.session_state.show_snap_lines))
-        st.caption("公開API / 約20分遅延。点は断面交通量、線は近傍主要道路へ疑似スナップした可視化です。")
+        st.markdown("#### HERE Traffic")
+st.session_state.show_here_flow = st.checkbox("HERE Flow を重ねる", value=bool(st.session_state.show_here_flow))
+st.caption("HERE_API_KEY を secrets か環境変数に設定してください。")
+st.markdown("#### 危ない交差点")
+st.session_state.show_hotspots = st.checkbox("ヒートマップ / 3D柱 を表示", value=bool(st.session_state.show_hotspots))
         st.markdown("#### 任意タイルURL（透過PNG推奨）")
         custom_tile = st.text_input("例: https://…/{z}/{x}/{y}.png", "")
         st.markdown("</div>", unsafe_allow_html=True)
@@ -773,7 +707,8 @@ with col_map:
     # --- deck layers ---
     layers: List[pdk.Layer] = []
     layers += build_base_layers(st.session_state.map_choice, custom_tile)
-    layers += build_intersection_layers(hot_df, is_3d)
+    if st.session_state.show_hotspots:
+        layers += build_intersection_layers(hot_df, is_3d)
     layers += build_congestion_grid(df, is_3d)
 
     points, icon_labels, mini_fg, mini_bg, geojson = build_points_labels_buffers(df)
@@ -790,79 +725,57 @@ with col_map:
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
 
-    # --- JARTIC 5分値（点/線） ---
-    j_points: List[Dict] = []
-    roads: List[List[List[float]]] = []
-
-    if st.session_state.show_jartic_points or st.session_state.show_snap_lines:
-        gj = fetch_jartic_5min(EHIME_BBOX)
-        if gj:
-            j_points = jartic_features_to_points(gj)
-
-    if st.session_state.show_jartic_points and j_points:
-        pts_vis = [{
-            "position": p["position"],
-            "color": color_from_total(p["total"]),
-            "radius": size_from_total(p["total"]),
-            "tooltip": f"合計:{p['total']}台/5分 上り:{p['up']} 下り:{p['down']}"
-        } for p in j_points]
-        layers.append(
-            pdk.Layer(
-                "ScatterplotLayer", id="jartic-5min-points", data=pts_vis,
-                get_position="position", get_fill_color="color", get_radius="radius",
-                radius_min_pixels=3, radius_max_pixels=160, opacity=0.55, pickable=True
-            )
-        )
-
-    if st.session_state.show_snap_lines:
-        # 主要道路の取得（Overpass）
-        roads = fetch_osm_roads_overpass(EHIME_BBOX)
-        if roads and j_points:
-            lines = build_snap_lines(j_points, roads)
-            if lines:
-                layers.append(
-                    pdk.Layer(
-                        "PathLayer", id="jartic-5min-snaplines", data=lines,
-                        get_path="path", get_color="color", get_width="width",
-                        width_scale=1, opacity=0.95, pickable=True
-                    )
-                )
+    # HERE Traffic Flow
+    here_key = get_here_key()
+    if st.session_state.show_here_flow and here_key:
+        payload = fetch_here_flow(EHIME_BBOX, here_key)
+        paths = here_flow_to_paths(payload or {})
+        layer_here = build_here_flow_layer(paths)
+        if layer_here:
+            layers.append(layer_here)
+    elif st.session_state.show_here_flow and not here_key:
+        st.info("HERE_API_KEY が未設定です。secrets か環境変数に設定してください。")
 
     tooltip_html = (
-        "<div style='min-width:220px'>"
+        "<div style='min-width:180px'>"
         "<b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/>"
-        f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a><br/>"
-        "<small>JARTIC: 断面交通量（約20分遅延） / 線はOSMへ疑似スナップ</small>"
+        f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a>"
         "</div>"
     )
 
     deck = pdk.Deck(
         layers=layers,
-        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=11, pitch=(45 if is_3d else 0), bearing=0),
+        initial_view_state=pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=init_zoom, pitch=(45 if is_3d else 0), bearing=0),
         tooltip={
             "html": tooltip_html,
-            "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"360px","whiteSpace":"normal","wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px","borderRadius":"12px","border":"1px solid var(--border)"}
+            "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"320px","whiteSpace":"normal","wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px","borderRadius":"12px","border":"1px solid var(--border)"}
         },
         map_provider=None, map_style=None
     )
-    st.pydeck_chart(deck, use_container_width=True, height=640)
+    st.pydeck_chart(deck, use_container_width=True, height=620)
 
     # HUD
-    st.markdown("<div class='hud'><div class='hud-inner'>" + f"<div class='badge'>Zoom: {11}（初期）</div>" + "</div></div>", unsafe_allow_html=True)
+    st.markdown("<div class='hud'><div class='hud-inner'>" + f"<div class='badge'>Zoom: {init_zoom}（初期）</div>" + "</div></div>", unsafe_allow_html=True)
 
-    # 地図ピッカー
+    # レイヤピッカー（簡易版）
+    st.markdown("<div class='layers-fab'><div class='btn'>🗺️</div></div>", unsafe_allow_html=True)
     with st.expander("地図・レイヤ", expanded=False):
+        st.markdown("<div class='layers-panel'>", unsafe_allow_html=True)
         names = list(TILESETS.keys())
         cols = st.columns(4)
         for i, name in enumerate(names):
             with cols[i % 4]:
                 thumb = TILESETS[name]["thumb"]
                 active = (name == st.session_state.map_choice)
-                st.image(thumb, use_column_width=True)
+                st.markdown(f"<div class='card{' active' if active else ''}'><img class='thumb' src='{thumb}'/><div class='label'><span>{name}</span>" + ("<span>✓</span>" if active else "") + "</div></div>", unsafe_allow_html=True)
                 if st.button(f"{name} に切替", key=f"pick-{name}", use_container_width=True):
                     st.session_state.map_choice = name
                     st.rerun()
-        st.caption("地図タイル: OSM/GSI/OpenTopoMap/HOT/GSI航空写真（APIキー不要） / JARTIC 5分値（キー不要・約20分遅延）")
+        st.caption(
+            "地図タイル: " + ", ".join(sorted({TILESETS[n]["copyright"] for n in names}))
+            + " / HERE Traffic Flow (要 HERE_API_KEY)"
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # legend
     legend_items = []
@@ -904,4 +817,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真（APIキー不要） | JARTIC 5分値（点）＋ OSMスナップ線（擬似渋滞） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
+st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真（APIキー不要） | HERE Traffic Flow（要 HERE_API_KEY） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
