@@ -498,7 +498,7 @@ def _nearest_on_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[f
 
 @st.cache_data(ttl=180)
 def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]],
-                     base_min: int = 300, base_max: int = 1000, thresh_m: int = 220) -> List[Dict]:
+                     base_min: int = 30, base_max: int = 100000, thresh_m: int = 220) -> List[Dict]:
     """
     交通量に応じて線長を 300m〜1000m に自動調整。
       length_m = base_min + min(base_max-base_min, jt_total*2)  # total>=350で約1km
