@@ -26,7 +26,7 @@ try:
 except Exception:
     _HAS_GEMINI = False
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
+APP_TITLE = "愛媛セーフティ・プラットフォーム"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
 USER_AGENT = "ESP/8.0 (gemini+gazetteer)"
 TIMEOUT = 12
@@ -102,7 +102,7 @@ st.markdown(
         <div class="id">ES</div>
         <div>
           <div>{APP_TITLE}</div>
-          <div class="subnote">今に強い・先を読む。地図で一目、要点は簡潔。</div>
+          <div class="subnote">今を知り・危険の先を読む危険確認プラットフォーム</div>
         </div>
       </div>
     </div>
