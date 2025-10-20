@@ -512,6 +512,7 @@ for c in centers:
             icon_labels.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
             if len(mini_labels_fg) < MAX_LABELS:
                 vtxt = (row["summary"] or "")[:4]; vtxt = "
+                vtxt = "\\n".join(list(vtxt))
 ".join(list(vtxt))
                 offset_px = int(-14*LABEL_SCALE)
                 mini_labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
