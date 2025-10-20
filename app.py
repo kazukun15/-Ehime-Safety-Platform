@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.1
-# - 件数ホバー表示を廃止（Heatmap/Gridは pickable=False）
-# - HexagonLayer を完全削除
-# - TomTom Traffic(Flow) タイルを secrets 経由で重畳可能に
-# - 既存機能維持（速報→位置推定、2D/3D、交差点ヒート、凡例、フィード）
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v9.2
+# - 地図タイル選択が反映されない問題を修正（TileLayer にユニーク id を付与）
+# - HexagonLayer を削除／件数ホバーを廃止
+# - TomTom Flow/Incidents タイル追加（secrets からキー取得）
+# - 1枚タイル健診（診断）を同梱
+# - 既存の速報スクレイピング→ガゼッティア/Nominatim→概位置バッファ表示 ほかは維持
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ import streamlit as st
 import pydeck as pdk
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
-import h3  # クラスタ＆スパイダーファンアウトに使用（HexagonLayerは不使用）
+import h3  # クラスタ→スパイダー展開に使用（HexagonLayer は不使用）
 
 # === Gemini (任意) ===
 try:
@@ -30,7 +31,7 @@ except Exception:
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.1 (no-hex, no-count, tomtom)"
+USER_AGENT = "ESP/9.2 (tile-id-fix, tomtom)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -128,11 +129,13 @@ with st.sidebar:
 
     st.markdown("#### TomTom 渋滞表示")
     tomtom_style = st.selectbox(
-        "表示スタイル（Flow）",  # relative0/1: 相対渋滞、absolute: 実速度
-        ["relative0","relative1","absolute"],
+        "Flow スタイル",
+        ["relative0", "relative1", "absolute", "relative0-dark", "absolute-dark"],
         index=0
     )
-    show_tomtom = st.checkbox("TomTom 渋滞を重ねる（APIキー必要）", value=False)
+    show_tomtom_flow = st.checkbox("TomTom Flow を重ねる", value=False)
+    show_tomtom_inc  = st.checkbox("TomTom Incidents を重ねる", value=False)
+    tomtom_opacity   = st.slider("TomTom タイル不透明度", 0.0, 1.0, 0.75, 0.05)
 
     st.markdown("#### 任意タイルURL（透過PNG推奨）")
     custom_tile = st.text_input("例: https://…/{z}/{x}/{y}.png", "")
@@ -145,7 +148,7 @@ def get_sqlite():
     os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect("data/esp_cache.sqlite", check_same_thread=False)
     with conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS geocode_cache(key TEXT PRIMARY KEY, lon REAL, lat REAL, type TEXT, created_at TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS geocode_cache(key TEXT PRIMARY KEY, json TEXT, created_at TEXT)")
         conn.execute("CREATE TABLE IF NOT EXISTS llm_cache(key TEXT PRIMARY KEY, json TEXT, created_at TEXT)")
     return conn
 conn = get_sqlite(); conn_lock = threading.Lock()
@@ -295,7 +298,7 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not (_HAS_GEMINI and api_key):
         return []
-    key_src = f"gem8|{muni_hint or ''}|{full_text}"
+    key_src = f"gem9|{muni_hint or ''}|{full_text}"
     key = hashlib.sha1(key_src.encode("utf-8")).hexdigest()
     cached = cache_get("llm_cache", key)
     if cached:
@@ -381,10 +384,7 @@ for it in raw_items:
     extracted.append(ex)
 
 # Gazetteer（任意）
-@st.cache_resource
-def load_gazetteer_df():
-    return load_gazetteer("data/gazetteer_ehime.csv")
-gdf = load_gazetteer_df()
+gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
 def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
@@ -468,7 +468,7 @@ def color_from_count(c:int) -> List[int]:
 hot_df["rgba"] = hot_df["count"].apply(color_from_count)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)  # 3D柱の高さ
 
-# ===== カテゴリ色 =====
+# ===== カテゴリ色／アイコン =====
 CAT_STYLE = {
     "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
     "火災":     {"color":[245, 130, 50, 235],  "radius":88, "icon":"🔥"},
@@ -479,27 +479,7 @@ CAT_STYLE = {
     "その他":   {"color":[128, 144, 160, 220], "radius":70, "icon":"・"},
 }
 
-# ===== クラスタ → スパイダー展開 =====
-def h3_res_from_zoom(zoom_val:int) -> int:
-    return {7:5,8:6,9:7,10:8,11:9,12:9,13:10,14:10}.get(zoom_val, 8)
-
-def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
-    res = h3_res_from_zoom(zoom_val)
-    groups: Dict[str, List[Dict]] = {}
-    for _, r in df.iterrows():
-        lon, lat = float(r["lon"]), float(r["lat"])
-        cell = h3.latlng_to_cell(lat, lon, res) if hasattr(h3, "latlng_to_cell") else h3.geo_to_h3(lat, lon, res)
-        d = r.to_dict(); d["cell"] = cell
-        groups.setdefault(cell, []).append(d)
-    centers: List[Dict] = []
-    for cell, rows in groups.items():
-        if hasattr(h3, "cell_to_latlng"):
-            lat, lon = h3.cell_to_latlng(cell)
-        else:
-            lat, lon = h3.h3_to_geo(cell)
-        centers.append({"cell":cell, "lon":lon, "lat":lat, "count":len(rows), "rows":rows})
-    return centers
-
+# ===== 可視化データ（クラスタ→スパイダー展開） =====
 vis_df = df
 centers = cluster_points(vis_df, ZOOM_LIKE) if not vis_df.empty else []
 
@@ -534,12 +514,13 @@ for c in centers:
             icon_labels.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
             if len(mini_labels_fg) < MAX_LABELS:
                 vtxt = (row["summary"] or "")[:4]
-                vtxt = "\n".join(list(vtxt))
+                vtxt = "\n".join(list(vtxt))  # 縦並び
                 offset_px = int(-14*LABEL_SCALE)
                 mini_labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
                 mini_labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
             polys.append({"lon":lon,"lat":lat,"r":int(row.get("radius_m",600))})
     else:
+        # 集中箇所の簡易表示（件数テキストは表示しない）
         points.append({"position":[clon,clat],"color":[100,100,100,210],"radius":70,"c":"集中","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎"})
         icon_labels.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
 
@@ -565,6 +546,7 @@ geojson = {"type":"FeatureCollection","features": geo_features}
 col_map, col_feed = st.columns([7,5], gap="large")
 
 with col_map:
+    # ベースタイル
     TILESETS = {
         "GSI 淡色": {"url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", "max_zoom": 18},
         "GSI 標準": {"url": "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png", "max_zoom": 18},
@@ -573,23 +555,23 @@ with col_map:
         "OpenTopoMap": {"url": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png", "max_zoom": 17},
     }
     TILE = TILESETS.get(map_choice, TILESETS["GSI 淡色"])
-
     is_3d = (mode_3d == "3D")
 
-    # 交差点ホットスポット（2D/3D）
+    # 交差点ホットスポット
     intersection_layers = []
     if not hot_df.empty:
         if is_3d:
             intersection_layers.append(
                 pdk.Layer(
                     "ColumnLayer",
+                    id="hot-columns",
                     data=hot_df,
                     get_position="position",
                     get_elevation="elev",
                     elevation_scale=1.0,
                     radius=65,
                     get_fill_color="rgba",
-                    pickable=True,     # 柱はピッカブル（件数テキストは出さないがツールチップは維持）
+                    pickable=True,
                     extruded=True,
                 )
             )
@@ -597,18 +579,19 @@ with col_map:
             intersection_layers.append(
                 pdk.Layer(
                     "HeatmapLayer",
+                    id="hot-heatmap",
                     data=hot_df,
                     get_position="position",
                     get_weight="weight",
                     radius_pixels=60,
                     intensity=0.85,
                     threshold=0.05,
-                    opacity=0.35,      # 道路が見える
-                    pickable=False      # 件数ホバーを廃止
+                    opacity=0.35,
+                    pickable=False
                 )
             )
 
-    # 推定渋滞（事故密度グリッド）—視覚のみ（件数表示なし）
+    # 推定渋滞（事故密度）—視覚のみ
     congestion_layer = None
     if (not df.empty) and (not is_3d):
         acc = df[df["category"] == "交通事故"].copy()
@@ -617,13 +600,14 @@ with col_map:
             acc["weight"] = 1.0
             congestion_layer = pdk.Layer(
                 "GridLayer",
+                id="congestion-grid",
                 data=acc,
                 get_position="position",
                 get_weight="weight",
                 cell_size=200,
                 extruded=False,
                 opacity=0.18,
-                pickable=False,       # 件数ホバーを廃止
+                pickable=False,
                 aggregation="SUM",
                 colorRange=[
                     [255, 180, 180, 60],
@@ -635,21 +619,68 @@ with col_map:
                 ],
             )
 
-    # TomTom Traffic Flow（APIキーがあり、チェック時のみ）
-    layers = [
-        pdk.Layer("TileLayer", data=TILE["url"], min_zoom=0, max_zoom=TILE.get("max_zoom",18), tile_size=256, opacity=1.0),
-    ]
+    # ===== レイヤ構成（ユニーク id を付けて選択反映を保証） =====
+    layers: List[pdk.Layer] = []
+
+    # ベース地図（id を map_choice に依存させる）
+    layers.append(
+        pdk.Layer(
+            "TileLayer",
+            id=f"base-{map_choice.replace(' ','_')}",
+            data=TILE["url"],
+            min_zoom=0,
+            max_zoom=TILE.get("max_zoom", 18),
+            tile_size=256,
+            opacity=1.0,
+            refinement="no-overlap",
+        )
+    )
 
     # 任意タイル
     if custom_tile.strip():
-        layers.append(pdk.Layer("TileLayer", data=custom_tile.strip(), min_zoom=0, max_zoom=22, tile_size=256, opacity=0.6))
+        layers.append(
+            pdk.Layer(
+                "TileLayer",
+                id="custom-overlay",
+                data=custom_tile.strip(),
+                min_zoom=0,
+                max_zoom=22,
+                tile_size=256,
+                opacity=0.6,
+                refinement="no-overlap",
+            )
+        )
 
-    # TomTom Flow overlay
+    # TomTom Flow / Incidents（secrets）
     tomtom_key = st.secrets.get("TOMTOM_API_KEY", "") or os.getenv("TOMTOM_API_KEY", "")
-    if show_tomtom and tomtom_key:
-        # 例: https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key=KEY
-        tomtom_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{tomtom_style}/{{z}}/{{x}}/{{y}}.png?key={tomtom_key}"
-        layers.append(pdk.Layer("TileLayer", data=tomtom_url, min_zoom=0, max_zoom=22, tile_size=256, opacity=0.65))
+    if show_tomtom_flow and tomtom_key:
+        flow_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{tomtom_style}/{{z}}/{{x}}/{{y}}.png?key={tomtom_key}"
+        layers.append(
+            pdk.Layer(
+                "TileLayer",
+                id=f"tomtom-flow-{tomtom_style}",
+                data=flow_url,
+                min_zoom=0,
+                max_zoom=22,
+                tile_size=256,
+                opacity=tomtom_opacity,
+                refinement="no-overlap",
+            )
+        )
+    if show_tomtom_inc and tomtom_key:
+        inc_url = f"https://api.tomtom.com/traffic/map/4/tile/incidents/{{z}}/{{x}}/{{y}}.png?key={tomtom_key}"
+        layers.append(
+            pdk.Layer(
+                "TileLayer",
+                id="tomtom-incidents",
+                data=inc_url,
+                min_zoom=0,
+                max_zoom=22,
+                tile_size=256,
+                opacity=min(0.9, tomtom_opacity),
+                refinement="no-overlap",
+            )
+        )
 
     # 交差点／推定渋滞
     for L in intersection_layers:
@@ -657,20 +688,21 @@ with col_map:
     if congestion_layer is not None:
         layers.append(congestion_layer)
 
-    # 既存の概位置・ポイント・ラベル・円
+    # 概位置・ポイント・ラベル・円
     layers += [
-        pdk.Layer("GeoJsonLayer", data=geojson, pickable=False, stroked=True, filled=True,
+        pdk.Layer("GeoJsonLayer", id="approx-buffers", data=geojson, pickable=False, stroked=True, filled=True,
                   get_line_width=2, get_line_color=[0,160,220], get_fill_color=[0,160,220,40], auto_highlight=False),
-        pdk.Layer("ScatterplotLayer", data=points, get_position="position", get_fill_color="color", get_radius="radius",
+        pdk.Layer("ScatterplotLayer", id="incident-points", data=points, get_position="position", get_fill_color="color", get_radius="radius",
                   pickable=True, radius_min_pixels=3, radius_max_pixels=60),
-        pdk.Layer("TextLayer", data=icon_labels, get_position="position", get_text="label", get_color="tcolor",
+        pdk.Layer("TextLayer", id="icon-labels", data=icon_labels, get_position="position", get_text="label", get_color="tcolor",
                   get_size=14, get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
-        pdk.Layer("TextLayer", data=mini_labels_bg, get_position="position", get_text="label", get_color="tcolor",
+        pdk.Layer("TextLayer", id="mini-labels-bg", data=mini_labels_bg, get_position="position", get_text="label", get_color="tcolor",
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
-        pdk.Layer("TextLayer", data=mini_labels_fg, get_position="position", get_text="label", get_color="tcolor",
+        pdk.Layer("TextLayer", id="mini-labels-fg", data=mini_labels_fg, get_position="position", get_text="label", get_color="tcolor",
                   get_size=int(12*LABEL_SCALE), get_pixel_offset="offset", get_alignment_baseline="bottom", get_text_anchor="middle"),
     ]
 
+    # ツールチップ（件数テキストは載せない）
     tooltip_html = """
     <div style='min-width:180px'>
       <b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/><a href='{src}' target='_blank'>出典</a>
@@ -688,6 +720,31 @@ with col_map:
         map_provider=None, map_style=None
     )
     st.pydeck_chart(deck, use_container_width=True, height=620)
+
+    # ===== TomTom タイル健診（診断・任意） =====
+    with st.expander("TomTom タイル健診（表示されない時の診断）", expanded=False):
+        if tomtom_key:
+            z = 14
+            import math
+            lat, lon = EHIME_PREF_LAT, EHIME_PREF_LON
+            n = 2.0 ** z
+            xtile = int((lon + 180.0) / 360.0 * n)
+            lat_rad = math.radians(lat)
+            ytile = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+
+            test_url = f"https://api.tomtom.com/traffic/map/4/tile/flow/{tomtom_style}/{z}/{xtile}/{ytile}.png?key={tomtom_key}"
+            st.code(test_url, language="text")
+            try:
+                rr = requests.get(test_url, timeout=8)
+                st.write("HTTP:", rr.status_code)
+                if rr.ok and rr.headers.get("content-type","").startswith("image/"):
+                    st.image(rr.content, caption="Flow タイル 1枚テスト（ズーム14, 松山付近）")
+                else:
+                    st.warning("画像が返っていません。Referer制限 / スタイル名 / キー権限を確認してください。")
+            except Exception as e:
+                st.error(f"取得エラー: {e}")
+        else:
+            st.info("TOMTOM_API_KEY が未設定です。secrets に設定してください。")
 
     # 凡例
     legend_items = []
@@ -727,4 +784,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: GSI / OSM / OpenTopoMap（APIキー不要） | 情報: 県警速報＋交差点CSV＋推定渋滞（事故密度/任意）＋TomTom Flow（要キー）。緊急時は110・119へ。")
+st.caption("地図: GSI / OSM / OpenTopoMap（APIキー不要） | TomTom Traffic（要キー） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
