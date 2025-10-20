@@ -1,3 +1,11 @@
+# -*- coding: utf-8 -*-
+# 愛媛セーフティ・プラットフォーム v9.9-A5
+# - ツールチップは {info_html} 統一（未展開の {c}{s}{m}{pred} を完全排除）
+# - JARTIC 点/線ホバー：時刻（JST）・合計・上り・下り
+# - 擬似渋滞線の長さを 0〜10km に線形スケーリング (length_m = clamp(total*20, 0, 10_000))
+# - 擬似渋滞線は OSMの「該当ウェイの折れ線に沿うサブパス」を抽出して描画（道路の向きに厳密追従）
+# - 既存機能維持：速報→位置推定、交差点ヒート/3D柱 ON/OFF、JARTIC 点、フェールセーフ、フィード 等
+
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -23,7 +31,7 @@ except Exception:
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A4 (info_html+line30-10000)"
+USER_AGENT = "ESP/9.9-A5 (info_html+snap_subpath_0_10km)"
 TIMEOUT = 15
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -334,13 +342,13 @@ def short_summary(s: str, max_len: int = 64) -> str:
 
 def make_prediction(category:str, muni:Optional[str]) -> str:
     return {
-        "詐欺":"SNSや投資の誘いに注意。送金前に家族や警察へ相談。",
-        "交通事故":"夕方や雨天の交差点で増えやすい。横断と右左折に注意。",
+        "詐欺":"SNSや投資の誘いに注意してください。送金前に家族や警察へ相談を。",
+        "交通事故":"夕方や雨天の交差点で増えやすい。横断時右左折に注意。",
         "窃盗":"自転車・車両の施錠と防犯登録。夜間の無施錠放置を避ける。",
-        "火災":"乾燥時は屋外火気に配慮。電源周り・喫煙の始末を再確認。",
-        "事件":"不審連絡は記録を残し通報。学校・公共施設周辺で意識を。",
-        "死亡事案":"詳細は出典で確認。周辺では救急活動に配慮。",
-    }.get(category, "同種事案が続く可能性。出典で最新を確認。")
+        "火災":"乾燥時は屋外火気に配慮し、電源周り・喫煙の始末の再確認をしてください。。",
+        "事件":"不審連絡は記録を残し通報。学校・公共施設周辺で意識してください。",
+        "死亡事案":"詳細は出典で確認してください。現場周辺では救急活動に配慮してください。",
+    }.get(category, "同種事案が続く可能性があります。出典で最新を確認。")
 
 CAT_STYLE = {
     "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
@@ -359,7 +367,7 @@ def make_incident_info_html(c:str, s:str, m:str, pred:str) -> str:
     if s: parts.append(s)
     if m: parts.append(m)
     if pred: parts.append(f"予測: {pred}")
-    parts.append(f"<a href='{EHIME_POLICE_URL_TXT}' target='_blank'>出典</a>")
+    parts.append(f"<a href='{EHIME_POLICE_URL}' target='_blank'>出典</a>")
     return "<div style='min-width:240px'>" + "<br/>".join(parts) + "</div>"
 
 def make_jartic_info_html(tlabel:str, total:int, up:int, down:int) -> str:
@@ -389,6 +397,7 @@ def fetch_jartic_5min(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> Tupl
     """
     Returns: (geojson, tlabel) where tlabel like 'YYYY-MM-DD HH:MM (JST)'
     """
+    # JARTICの公開は約20分遅延、5分刻み
     t = round_to_5min(jst_now() - timedelta(minutes=20))
     tcode = t.strftime("%Y%m%d%H%M")
     tlabel = t.strftime("%Y-%m-%d %H:%M (JST)")
@@ -447,55 +456,144 @@ def size_from_total(total:int) -> int:
     return 48 + int(min(260, total * 0.9))
 
 # ----------------------------------------------------------------------------
-# OSM（Overpass）＆擬似渋滞線（赤）300m〜1000m
+# OSM（Overpass）＆擬似渋滞線（赤）0〜10km：ウェイに沿ったサブパス抽出
 # ----------------------------------------------------------------------------
 OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 
 @st.cache_data(ttl=600)
-def fetch_osm_roads_overpass(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> List[List[List[float]]]:
+def fetch_osm_roads_overpass(bbox: Tuple[float,float,float,float] = EHIME_BBOX) -> List[Dict]:
+    """
+    指定BBOX内の主要道路ウェイを取得し、各ウェイを
+      {"coords":[[lon,lat],...], "oneway":bool}
+    形式で返す。
+    """
     minLon, minLat, maxLon, maxLat = bbox
     q = f"""
     [out:json][timeout:25];
     (
       way["highway"~"^(motorway|trunk|primary|secondary|tertiary)$"]({minLat},{minLon},{maxLat},{maxLon});
     );
-    out geom;
+    out tags geom;
     """
     try:
         r = requests.post(OVERPASS_URL, data={"data": q}, timeout=TIMEOUT)
         r.raise_for_status()
         data = r.json()
-        lines: List[List[List[float]]] = []
+        out: List[Dict] = []
         for el in data.get("elements", []):
             if el.get("type") == "way" and "geometry" in el:
                 coords = [[pt["lon"], pt["lat"]] for pt in el["geometry"]]
                 if len(coords) >= 2:
-                    lines.append(coords)
-        return lines
+                    tags = el.get("tags", {}) or {}
+                    oneway = str(tags.get("oneway","no")).lower() in ("yes","1","true")
+                    out.append({"coords": coords, "oneway": oneway})
+        return out
     except Exception:
         return []
 
-def _nearest_on_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[float,float]) -> Tuple[Tuple[float,float], Tuple[float,float], float]:
+def _meters_scale(lat: float) -> Tuple[float,float]:
+    # 1度あたりの距離（近似）
+    return 111320 * math.cos(math.radians(lat)), 110540
+
+def _dist_m(a: Tuple[float,float], b: Tuple[float,float]) -> float:
+    (lon1,lat1),(lon2,lat2) = a,b
+    kx, ky = _meters_scale((lat1+lat2)/2)
+    return math.hypot((lon2-lon1)*kx, (lat2-lat1)*ky)
+
+def _project_to_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[float,float]) -> Tuple[Tuple[float,float], float, float]:
+    """
+    p を線分abに直交射影。戻り値=(projLonLat, t[0..1], dist_m)
+    """
     ax, ay = a; bx, by = b; px, py = p
-    kx = 111320 * math.cos(math.radians((ay+by)/2)); ky = 110540
+    kx, ky = _meters_scale((ay+by)/2)
     ax2, ay2, bx2, by2, px2, py2 = ax*kx, ay*ky, bx*kx, by*ky, px*kx, py*ky
     vx, vy = bx2-ax2, by2-ay2; wx, wy = px2-ax2, py2-ay2
     seglen2 = vx*vx + vy*vy
-    if seglen2 == 0: return (a, (0.0,0.0), math.hypot(px2-ax2, py2-ay2))
+    if seglen2 == 0:
+        return a, 0.0, math.hypot(px2-ax2, py2-ay2)
     t = max(0.0, min(1.0, (wx*vx + wy*vy) / seglen2))
     projx2, projy2 = ax2 + t*vx, ay2 + t*vy
     proj = (projx2 / kx, projy2 / ky)
-    dir_vec = (bx - ax, by - ay)
     dist_m = math.hypot(px2-projx2, py2-projy2)
-    return (proj, dir_vec, dist_m)
+    return proj, t, dist_m
+
+def _nearest_point_on_way(p: Tuple[float,float], way_coords: List[List[float]]) -> Tuple[int, float, Tuple[float,float], float]:
+    """
+    ウェイ上の最短射影点を求める。
+    戻り値 = (seg_index, t_in_seg[0..1], projLonLat, dist_m)
+    """
+    best = (0, 0.0, tuple(way_coords[0]), float("inf"))
+    for i in range(len(way_coords)-1):
+        a = tuple(way_coords[i]); b = tuple(way_coords[i+1])
+        proj, t, d = _project_to_segment(p, a, b)
+        if d < best[3]:
+            best = (i, t, proj, d)
+    return best
+
+def _subpath_centered_on(way_coords: List[List[float]], seg_idx: int, t: float, length_m: float) -> List[List[float]]:
+    """
+    ウェイの折れ線に沿って、指定射影点を中心に length_m のサブパスを抽出。
+    前後それぞれ half = length_m/2 ずつ辿る。
+    """
+    if length_m <= 0:
+        # 点相当でもPathLayerは最低2点必要 → 1mだけ延ばす
+        length_m = 1.0
+    half = length_m / 2.0
+
+    # 射影点を明示的に頂点列へ差し込む（seg_idxとtから内分点）
+    a = way_coords[seg_idx]; b = way_coords[seg_idx+1]
+    ax, ay = a; bx, by = b
+    proj = [ax + (bx-ax)*t, ay + (by-ay)*t]
+
+    # 後方へ half だけ辿る
+    back_pts: List[List[float]] = [proj]
+    remain = half
+    i = seg_idx
+    cur = proj
+    while i >= 0 and remain > 0:
+        prev = way_coords[i]
+        d = _dist_m(tuple(cur), tuple(prev))
+        if d >= remain:
+            # 内分点
+            ratio = remain / d if d > 0 else 0
+            x = cur[0] + (prev[0]-cur[0]) * ratio
+            y = cur[1] + (prev[1]-cur[1]) * ratio
+            back_pts.append([x,y]); remain = 0; break
+        else:
+            back_pts.append(prev); remain -= d; cur = prev; i -= 1
+
+    # 前方へ half だけ辿る
+    fwd_pts: List[List[float]] = [proj]
+    remain = half
+    i = seg_idx + 1
+    cur = proj
+    while i < len(way_coords) and remain > 0:
+        nxt = way_coords[i]
+        d = _dist_m(tuple(cur), tuple(nxt))
+        if d >= remain:
+            ratio = remain / d if d > 0 else 0
+            x = cur[0] + (nxt[0]-cur[0]) * ratio
+            y = cur[1] + (nxt[1]-cur[1]) * ratio
+            fwd_pts.append([x,y]); remain = 0; break
+        else:
+            fwd_pts.append(nxt); remain -= d; cur = nxt; i += 1
+
+    # back（逆順）+ fwd（先）で中心を含むサブパス
+    back_pts = back_pts[::-1]
+    # 中心点が重複するので fwd の先頭を落とす
+    path = back_pts + fwd_pts[1:]
+    # 最低2点
+    if len(path) < 2:
+        path.append(path[0][:])
+    return path
 
 @st.cache_data(ttl=180)
-def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]],
-                     base_min: int = 30, base_max: int = 10000, thresh_m: int = 220) -> List[Dict]:
+def build_snap_lines(j_points: List[Dict], ways: List[Dict],
+                     base_min: int = 0, base_max: int = 10_000, thresh_m: int = 220) -> List[Dict]:
     """
-    交通量に応じて線長を 30m〜10000m に自動調整。
-      length_m = base_min + min(base_max-base_min, jt_total*2)  # total>=500で約10km
-    道路が遠い/無い場合は東西短線（同じ長さ）でフェールセーフ。
+    交通量に応じて線長を 0〜10,000m に自動調整（total*20 を 0..10km にクランプ）。
+    OSMウェイ上の最短射影点を中心に、そのウェイの折れ線に沿ったサブパスを抽出して描画。
+    道路が遠い/無い場合は東西短線（length_mに応じた長さ）でフェールセーフ。
     """
     out: List[Dict] = []
     if not j_points: return out
@@ -504,38 +602,33 @@ def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]],
     for jp in j_points:
         lon, lat = jp["position"]; p = (lon, lat)
         total = int(jp.get("total", jp.get("jt_total", 0)))
-        # 可変長（上限1km）
-        length_m = base_min + min(base_max - base_min, total * 2)
+        # 0〜10km スケーリング（50台/5分→1km、500台→上限10km）
+        length_m = max(base_min, min(base_max, total * 20.0))
 
-        best = None
-        if roads:
-            for line in roads:
-                for i in range(len(line)-1):
-                    a = tuple(line[i]); b = tuple(line[i+1])
-                    proj, dv, d = _nearest_on_segment(p, a, b)
-                    if (best is None) or (d < best[2]):
-                        best = (proj, dv, d)
+        # 近傍ウェイ探索
+        best = None  # (dist_m, way_idx, seg_idx, t, projLonLat)
+        for wi, way in enumerate(ways):
+            coords = way["coords"]
+            seg_idx, t, proj, d = _nearest_point_on_way(p, coords)
+            if (best is None) or (d < best[0]):
+                best = (d, wi, seg_idx, t, proj)
 
-        if best and best[2] <= thresh_m:
-            proj, dv, _ = best
-            vx, vy = dv; mag = math.hypot(vx, vy) or 1.0
-            ux, uy = vx/mag, vy/mag
-            kx = 111320 * math.cos(math.radians(proj[1])); ky = 110540
-            half = length_m / 2.0
-            dx_deg = (ux * half) / kx; dy_deg = (uy * half) / ky
-            p1 = [proj[0] - dx_deg, proj[1] - dy_deg]
-            p2 = [proj[0] + dx_deg, proj[1] + dy_deg]
+        if best and best[0] <= thresh_m:
+            _, wi, seg_idx, t, _ = best
+            coords = ways[wi]["coords"]
+            path = _subpath_centered_on(coords, seg_idx, t, length_m)
         else:
             # フェールセーフ：東西線
-            kx = 111320 * math.cos(math.radians(lat))
+            kx, _ = _meters_scale(lat)
             half = length_m / 2.0
-            dx_deg = half / kx
+            dx_deg = half / max(kx, 1e-6)
             p1 = [lon - dx_deg, lat]
             p2 = [lon + dx_deg, lat]
+            path = [p1, p2]
 
-        width_px = 5 + min(12, (total // 100))
+        width_px = 5 + min(14, (total // 100))
         out.append({
-            "path": [p1, p2], "color": RED, "width": width_px,
+            "path": path, "color": RED, "width": width_px,
             "info_html": make_jartic_info_html(
                 jp.get("jt_time"), jp.get("jt_total", 0), jp.get("jt_up", 0), jp.get("jt_down", 0)
             ),
@@ -722,8 +815,14 @@ hot_df["count"] = hot_df["count"].astype(int)
 max_count = int(hot_df["count"].max()) if not hot_df.empty else 1
 hot_df["position"] = hot_df.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
 hot_df["weight"] = hot_df["count"].astype(float)
-color_from_count = color_from_count_factory(max_count)
-hot_df["rgba"] = hot_df["count"].apply(color_from_count)
+def _cfc(c:int) -> List[int]:
+    t = max(0.0, min(1.0, (c-1) / max(1, max_count-1)))
+    if t < 0.5:
+        u = t/0.5; r = int(255*(1-u)+255*u); g = int(212*(1-u)+107*u); b = int(212*(1-u)+107*u)
+    else:
+        u = (t-0.5)/0.5; r = int(255*(1-u)+217*u); g = int(107*(1-u)+4*u); b = int(107*(1-u)+41*u)
+    return [r,g,b, 190 if c>=5 else 180]
+hot_df["rgba"] = hot_df["count"].apply(_cfc)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)
 
 # ----------------------------------------------------------------------------
@@ -746,14 +845,18 @@ with st.sidebar:
                                                       value=bool(st.session_state.show_jartic_points))
     st.session_state.show_snap_lines   = st.checkbox("JARTIC 5分値（線：OSMスナップ）",
                                                       value=bool(st.session_state.show_snap_lines))
-    st.caption("公開API / 約20分遅延。点=断面交通量、線=近傍道路へ擬似スナップ（赤い“渋滞線”：300m〜1km）。")
+    st.caption("公開API / 約20分遅延。点=断面交通量、線=OSMウェイに沿ったサブパス（赤：0〜10km）。")
 
     st.markdown("#### 危ない交差点")
     st.session_state.show_hotspots = st.checkbox("ヒートマップ / 3D柱 を表示",
                                                  value=bool(st.session_state.show_hotspots))
 
-    st.markdown("#### 任意タイルURL（透過PNG推奨）")
-    custom_tile = st.text_input("例: https://…/{z}/{x}/{y}.png", "")
+    st.markdown("  ")  # 余白
+    st.markdown("#### 地図タイル")
+    map_choice = st.selectbox("地図スタイル", list(TILESETS.keys()),
+                              index=list(TILESETS.keys()).index(st.session_state.map_choice))
+    st.session_state.map_choice = map_choice
+    custom_tile = st.text_input("任意タイルURL（透過PNG推奨, {z}/{x}/{y})", "")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -787,12 +890,12 @@ with col_map:
     ]
 
     # --- JARTIC 5分値（点/線） ---
-    j_points: List[Dict] = []; roads: List[List[List[float]]] = []
+    j_points: List[Dict] = []; ways: List[Dict] = []
+    gj, tlabel = (None, None)
     if st.session_state.show_jartic_points or st.session_state.show_snap_lines:
         gj, tlabel = fetch_jartic_5min(EHIME_BBOX)
         if gj and tlabel:
-            raw_pts = jartic_features_to_points(gj, tlabel)
-            j_points = raw_pts
+            j_points = jartic_features_to_points(gj, tlabel)
 
     if st.session_state.show_jartic_points and j_points:
         pts_vis = [{
@@ -810,8 +913,8 @@ with col_map:
         )
 
     if st.session_state.show_snap_lines and j_points:
-        roads = fetch_osm_roads_overpass(EHIME_BBOX)
-        lines = build_snap_lines(j_points, roads)
+        ways = fetch_osm_roads_overpass(EHIME_BBOX)
+        lines = build_snap_lines(j_points, ways)  # 0〜10km スケール&ウェイに沿う
         if lines:
             layers.append(
                 pdk.Layer(
@@ -856,7 +959,7 @@ with col_map:
         "<div style='height:8px'></div>"
         "<div style='font-weight:600;margin-bottom:6px'>JARTIC 線（擬似）</div>"
         "<div class='redline-sample'></div>"
-        "<div class='risklbl'><span>赤い短線＝測定箇所の交通流方向を強調（長さ:300m〜1km）</span><span></span></div>"
+        "<div class='risklbl'><span>OSMウェイに沿った中心サブパス（赤）: 0〜10km</span><span></span></div>"
         "</div>"
     )
     st.markdown(
@@ -896,4 +999,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真 | JARTIC 5分値（点=量グラデ/線=赤い擬似渋滞 300m〜1km） | 交差点ヒート/柱 ON/OFF | 県警速報＋交差点CSV。緊急時は110・119へ。")
+st.caption("地図: OSM/GSI/OpenTopoMap/HOT/GSI航空写真 | JARTIC 5分値（点=量グラデ/線=OSMウェイに沿う 0〜10km） | 交差点ヒート/柱 ON/OFF | 県警速報＋交差点CSV。緊急時は110・119へ。")
