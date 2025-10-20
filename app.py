@@ -28,7 +28,7 @@ try:
 except Exception:
     _HAS_GEMINI = False
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
+APP_TITLE = "愛媛セーフティ・プラットフォーム"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
 USER_AGENT = "ESP/9.9-A4 (info_html+line300-1000)"
 TIMEOUT = 15
