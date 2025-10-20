@@ -1,14 +1,16 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v8.0
-# - 追加: Gemini 2.5 Flash による事案テキスト→地名候補抽出（無料タイル/キー無しでも動作、キーがあれば精度向上）
-# - 強化: ガゼッティア（外部CSV + 内蔵市町中心）を用いたジオコーディングの堅牢化
-# - 踏襲: 無料地図選択（GSI/OSM/HOT/OpenTopo）・2D/3D 切替・将来バッファ拡大・クラスタ/凡例/フィード
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v8.1
+# - 追加: 「事故の多い交差点」CSVを内蔵し、赤系グラデーションで可視化
+#         2D=HeatmapLayer / 3D=ColumnLayer(押し出し) で未来的かつ認知しやすい表示
+# - 追加: リスク凡例（強度バー＋最大件数を表示）
+# - 踏襲: Gemini 2.5 Flash 連携、ガゼッティア強化、無料タイル選択、2D/3D 切替、将来バッファ拡大
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
 
 import httpx
 import requests
@@ -26,9 +28,9 @@ try:
 except Exception:
     _HAS_GEMINI = False
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム"
+APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/8.0 (gemini+gazetteer)"
+USER_AGENT = "ESP/8.1 (gemini+gazetteer+hotspots)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -91,6 +93,8 @@ st.markdown(
       .feed-scroll {max-height:62vh; overflow-y:auto; padding-right:6px}
       @media (max-width: 640px){ .feed-scroll{max-height:48vh} }
       a { color: var(--a); }
+      .riskbar{height:10px; border-radius:6px; background:linear-gradient(90deg,#ffd4d4,#ff6b6b,#d90429);} 
+      .risklbl{display:flex; justify-content:space-between; font-size:.85rem; color:var(--muted); margin-top:4px}
     </style>
     """,
     unsafe_allow_html=True,
@@ -102,7 +106,7 @@ st.markdown(
         <div class="id">ES</div>
         <div>
           <div>{APP_TITLE}</div>
-          <div class="subnote">今を知り・危険の先を読む危険確認プラットフォーム</div>
+          <div class="subnote">今に強い・先を読む。地図で一目、要点は簡潔。</div>
         </div>
       </div>
     </div>
@@ -378,11 +382,6 @@ gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
 # ---- 座標決定順序（Gemini + ガゼッティア + 内蔵 + Nominatim + 県庁） ----
-# 1) Geminiが提案する候補（施設/交差点/町名）
-# 2) 外部ガゼッティア（候補名→一致/ファジー）
-# 3) 内蔵市町中心
-# 4) Nominatim（施設→市町）
-# 5) 県庁
 
 def try_gazetteer(name:str, min_score:int=78) -> Optional[Tuple[float,float,str]]:
     if not idx: return None
@@ -440,6 +439,47 @@ for ex, loc in zip(extracted, results):
     })
 
 df = pd.DataFrame(rows)
+
+# ===== 事故多発交差点 CSV（内蔵） =====
+CSV_TEXT = """地点名,緯度,経度,年間最多事故件数,補足
+天山交差点,33.8223,132.7758,6,松山市天山町付近（2023年に6件事故）
+和泉交差点,33.8216,132.7554,5,松山市和泉町付近（2023年に5件事故）
+小坂交差点,33.8266,132.7833,5,松山市枝松地区（2023年に5件事故）
+本町5丁目交差点,33.8530,132.7588,4,松山市中心部（2023年に4件事故）
+山越交差点,33.8565,132.7592,4,松山市山越（2023年に4件事故）
+消防局前交差点,33.8527,132.7588,4,松山市本町6丁目（2023年に4件事故）
+大川橋交差点,33.8739,132.7521,4,松山市鴨川町（2023年に4件事故）
+久米交差点,33.8143,132.7957,4,松山市久米地区（2023年に4件事故）
+"""
+
+hot_df = pd.read_csv(StringIO(CSV_TEXT))
+hot_df.rename(columns={"地点名":"name","緯度":"lat","経度":"lon","年間最多事故件数":"count","補足":"note"}, inplace=True)
+hot_df["lat"] = hot_df["lat"].astype(float)
+hot_df["lon"] = hot_df["lon"].astype(float)
+hot_df["count"] = hot_df["count"].astype(int)
+max_count = int(hot_df["count"].max()) if not hot_df.empty else 1
+
+# カラー/高さスケール（赤系グラデーション）
+def color_from_count(c:int) -> List[int]:
+    # 低: #ffd4d4 → 中: #ff6b6b → 高: #d90429 （アルファ230）
+    t = max(0.0, min(1.0, (c-1) / max(1, max_count-1)))
+    # 二段補間
+    if t < 0.5:
+        u = t/0.5
+        r = int(255*(1-u) + 255*u)
+        g = int(212*(1-u) + 107*u)
+        b = int(212*(1-u) + 107*u)
+    else:
+        u = (t-0.5)/0.5
+        r = int(255*(1-u) + 217*u)
+        g = int(107*(1-u) + 4*u)
+        b = int(107*(1-u) + 41*u)
+    return [r,g,b,230]
+
+hot_df["rgba"] = hot_df["count"].apply(color_from_count)
+hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)  # 3D柱の高さ
+hot_df["position"] = hot_df.apply(lambda r: [float(r["lon"]), float(r["lat"])], axis=1)
+hot_df["weight"] = hot_df["count"].astype(float)
 
 # ===== カテゴリ色（ライト/ダーク両対応） =====
 CAT_STYLE = {
@@ -534,9 +574,38 @@ with col_map:
     TILE = TILESETS.get(map_choice, TILESETS["GSI 淡色"])
 
     is_3d = (mode_3d == "3D")
+
+    # 事故多発交差点レイヤ
+    if not hot_df.empty:
+        if is_3d:
+            hotspot_layer = pdk.Layer(
+                "ColumnLayer",
+                data=hot_df,
+                get_position="position",
+                get_elevation="elev",
+                elevation_scale=1.0,
+                radius=65,
+                get_fill_color="rgba",
+                pickable=True,
+                extruded=True,
+            )
+        else:
+            hotspot_layer = pdk.Layer(
+                "HeatmapLayer",
+                data=hot_df,
+                get_position="position",
+                get_weight="weight",
+                radius_pixels=60,
+                intensity=1.0,
+                threshold=0.08,
+                aggregation='SUM'
+            )
+    else:
+        hotspot_layer = None
+
     hex_layer = pdk.Layer(
         "HexagonLayer",
-        data=[{"position":x["position"],"count":x["count"]} for x in hex_points],
+        data=[{"position":[c["lon"],c["lat"]],"count":c["count"]} for c in centers],
         get_position="position",
         get_elevation_weight="count",
         elevation_scale=10 if is_3d else 5,
@@ -550,6 +619,10 @@ with col_map:
 
     layers = [
         pdk.Layer("TileLayer", data=TILE["url"], min_zoom=0, max_zoom=TILE.get("max_zoom",18), tile_size=256, opacity=1.0),
+    ]
+    if hotspot_layer: layers.append(hotspot_layer)
+
+    layers += [
         hex_layer,
         pdk.Layer("GeoJsonLayer", data=geojson, pickable=False, stroked=True, filled=True,
                   get_line_width=2, get_line_color=[0,160,220], get_fill_color=[0,160,220,40], auto_highlight=False),
@@ -570,15 +643,20 @@ with col_map:
                   "borderRadius":"12px","border":"1px solid var(--border)"}
     }
 
-    initial_view = pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=9, pitch=(45 if is_3d else 0), bearing=0)
+    initial_view = pdk.ViewState(latitude=EHIME_PREF_LAT, longitude=EHIME_PREF_LON, zoom=11, pitch=(45 if is_3d else 0), bearing=0)
     deck = pdk.Deck(layers=layers, initial_view_state=initial_view, tooltip=tooltip, map_provider=None, map_style=None)
-    st.pydeck_chart(deck, use_container_width=True, height=560)
+    st.pydeck_chart(deck, use_container_width=True, height=600)
 
+    # 凡例（カテゴリ＋交差点強度）
     legend_items = []
     for k, v in CAT_STYLE.items():
         rgba = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
         legend_items.append(f"<span class='item'><span class='dot' style='background:{rgba}'></span>{k}</span>")
-    st.markdown(f"<div class='legend'>{''.join(legend_items)}<div style='margin-top:6px;color:var(--muted);font-size:.85rem'>円は概ねの範囲。詳細は出典を確認。</div></div>", unsafe_allow_html=True)
+    # 交差点強度バー
+    legend_html = f"<div class='legend'>{''.join(legend_items)}" \
+                  f"<div style='margin-top:10px'><div class='riskbar'></div>" \
+                  f"<div class='risklbl'><span>交差点リスク（低）</span><span>高：最大 {max_count}件/年</span></div></div></div>"
+    st.markdown(legend_html, unsafe_allow_html=True)
 
 with col_feed:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
@@ -608,4 +686,4 @@ with col_feed:
     st.markdown("\n".join(html_list), unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption("地図: GSI / OSM / OpenTopoMap（APIキー不要） | 情報: 県警速報。緊急時は110・119へ。")
+st.caption("地図: GSI / OSM / OpenTopoMap（APIキー不要） | 情報: 県警速報＋交差点CSV。緊急時は110・119へ。")
