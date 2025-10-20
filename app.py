@@ -1,18 +1,16 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v7.3
-# - Sidebar を簡素化：表示期間 + 地図タイル選択 + 2D/3D 切替
-# - 無料タイルのみ（APIキー不要）：GSI/OSM/OSM-HOT/OpenTopoMap
-# - 事案のフューチャーバッファ拡大（概位置円の半径を拡大）
-# - 機能は踏襲（県警スクレイプ→近似座標→クラスタ→可視化、要約・予測、フィード、凡例、スマホ最適）
+# 愛媛セーフティ・プラットフォーム / Ehime Safety Platform  v7.3.1
+# - 修正: Nominatim不達時でも市町中心へ確実に落とすための「内蔵ガゼッティア」追加
+# - 改善: ダーク/ライト両対応で視認性の高い配色（カテゴリ色を再調整）
+# - 仕様: v7.3（期間/地図タイル/2D-3D切替・将来バッファ拡大）を踏襲
 
-import os, re, math, time, json, sqlite3, threading, unicodedata
+import os, re, math, time, sqlite3, threading, unicodedata
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor
 
-import httpx
-import requests
+import httpx, requests
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
@@ -20,9 +18,9 @@ from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
 import h3
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム"
+APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/7.3 (ux/map2d3d)"
+USER_AGENT = "ESP/7.3.1 (builtin-gazetteer)"
 TIMEOUT = 12
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -30,16 +28,47 @@ MAX_WORKERS = 6
 EHIME_PREF_LAT = 33.8390
 EHIME_PREF_LON = 132.7650
 
-# ---- 将来影響を考慮した概位置バッファ倍率（既定 1.8倍） ----
+# 将来影響を考慮した概位置バッファ倍率
 FUTURE_BUFFER_SCALE = 1.8
 
-# 内部既定（UIからは隠す）
+# 内部既定
 ZOOM_LIKE = 10
 FANOUT_THRESHOLD = 4
 LABEL_SCALE = 1.0
 MAX_LABELS = 400
 
-CITY_NAMES = ["松山市","今治市","新居浜市","西条市","大洲市","伊予市","四国中央市","西予市","東温市","上島町","久万高原町","松前町","砥部町","内子町","伊方町","松野町","鬼北町","愛南町"]
+# 市町名（検出用）に宇和島市・八幡浜市も拡張
+CITY_NAMES = [
+    "松山市","今治市","新居浜市","西条市","大洲市","伊予市","四国中央市",
+    "西予市","東温市","上島町","久万高原町","松前町","砥部町","内子町",
+    "伊方町","松野町","鬼北町","愛南町","宇和島市","八幡浜市"
+]
+
+# 内蔵・市町中心（近似・参考値）
+# 失敗時でも各市町へ必ず落とすためのミニガゼッティア（緯度経度は概ねの中心）
+MUNI_CENTERS = {
+    "松山市":      (132.7650, 33.8390),
+    "今治市":      (133.0000, 34.0660),
+    "新居浜市":    (133.2830, 33.9600),
+    "西条市":      (133.1830, 33.9180),
+    "大洲市":      (132.5500, 33.5000),
+    "伊予市":      (132.7010, 33.7550),
+    "四国中央市":  (133.5500, 33.9800),
+    "西予市":      (132.5000, 33.3660),
+    "東温市":      (132.8710, 33.7930),
+    "上島町":      (133.2000, 34.2600),
+    "久万高原町":  (132.9040, 33.5380),
+    "松前町":      (132.7110, 33.7870),
+    "砥部町":      (132.7870, 33.7350),
+    "内子町":      (132.6580, 33.5360),
+    "伊方町":      (132.3560, 33.4880),
+    "松野町":      (132.7570, 33.2260),
+    "鬼北町":      (132.8800, 33.2280),
+    "愛南町":      (132.5660, 33.0000),
+    "宇和島市":    (132.5600, 33.2230),
+    "八幡浜市":    (132.4230, 33.4620),
+}
+
 CATEGORY_PATTERNS = [
     ("交通事故", r"交通.*事故|自転車|バス|二輪|乗用|衝突|交差点|国道|県道|人身事故"),
     ("火災",     r"火災|出火|全焼|半焼|延焼"),
@@ -50,32 +79,38 @@ CATEGORY_PATTERNS = [
 ]
 FACILITY_HINT = ["学校","小学校","中学校","高校","大学","グラウンド","体育館","公園","駅","港","病院","交差点"]
 
-# ===== Streamlit 基本設定・テーマ =====
+# ===== UIテーマ =====
 st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
 st.markdown(
     """
     <style>
       :root{
-        --bg: #0b0f14; --panel: #0f141b; --panel-2: #121924;
-        --text: #e6f1ff; --muted: #8aa0b6; --chip-border:#2b3a4d;
+        --bg:#0b0f14; --panel:#0f141b; --panel2:#121924;
+        --text:#e8f1ff; --muted:#8aa0b6; --border:#2b3a4d;
+        --a:#007aff; --b:#00b894;
       }
       @media (prefers-color-scheme: light){
-        :root{ --bg:#f7fafc; --panel:#fff; --panel-2:#f1f5f9; --text:#10212f; --muted:#516170; --chip-border:#dfe7ef;}
+        :root{
+          --bg:#f7fafc; --panel:#ffffff; --panel2:#f1f5f9;
+          --text:#0f2230; --muted:#586b7a; --border:#dfe7ef;
+          --a:#005acb; --b:#009a7a;
+        }
       }
       html, body, .stApp { background: var(--bg); color: var(--text); }
-      .topbar{ position: sticky; top:0; z-index:10; padding: 14px 16px; margin: -16px -16px 14px -16px;
-               border-bottom: 1px solid var(--chip-border); background: var(--panel); }
+      .topbar{ position: sticky; top:0; z-index:10; padding:14px 16px; margin:-16px -16px 14px -16px;
+               border-bottom:1px solid var(--border); background:var(--panel); }
       .brand{ display:flex; align-items:center; gap:10px; font-weight:800; font-size:1.05rem; }
       .brand .id{ width:28px; height:28px; border-radius:8px; display:grid; place-items:center;
-                  background: linear-gradient(135deg,#00e0ff,#7cffd9); color:#00131a; font-weight:900; }
+                  background: linear-gradient(135deg,var(--a),var(--b)); color:#00131a; font-weight:900; }
       .subnote{ color: var(--muted); font-size:.85rem; margin-top:4px}
-      .panel { background: var(--panel); border:1px solid var(--chip-border); border-radius: 14px; padding: 10px 12px; }
-      .legend { font-size:.95rem; background:var(--panel); border:1px solid var(--chip-border); border-radius:12px; padding:10px 12px;}
+      .panel { background: var(--panel); border:1px solid var(--border); border-radius: 14px; padding: 10px 12px; }
+      .legend { font-size:.95rem; background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:10px 12px;}
       .legend .item { display:inline-flex; align-items:center; margin-right:14px; margin-bottom:6px}
-      .dot { width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px; border:1px solid #00000022}
-      .feed-card {background:var(--panel); padding:12px 14px; border-radius:14px; border:1px solid var(--chip-border); margin-bottom:10px;}
+      .dot { width:12px; height:12px; border-radius:50%; display:inline-block; margin-right:6px; border:1px solid #0003}
+      .feed-card {background:var(--panel); padding:12px 14px; border-radius:14px; border:1px solid var(--border); margin-bottom:10px;}
       .feed-scroll {max-height:62vh; overflow-y:auto; padding-right:6px}
       @media (max-width: 640px){ .feed-scroll{max-height:48vh} }
+      a { color: var(--a); }
     </style>
     """,
     unsafe_allow_html=True,
@@ -87,12 +122,11 @@ st.markdown(
         <div class="id">ES</div>
         <div>
           <div>{APP_TITLE}</div>
-          <div class="subnote">今に強く・危険の先を読む</div>
+          <div class="subnote">今に強い・先を読む。地図で一目、要点は簡潔。</div>
         </div>
       </div>
     </div>
-    """,
-    unsafe_allow_html=True,
+    """, unsafe_allow_html=True
 )
 
 # ===== Sidebar =====
@@ -122,13 +156,11 @@ def get_sqlite():
         conn.execute("CREATE TABLE IF NOT EXISTS geocode_cache(key TEXT PRIMARY KEY, lon REAL, lat REAL, type TEXT, created_at TEXT)")
     return conn
 conn = get_sqlite(); conn_lock = threading.Lock()
-
 def geocode_cache_get(key:str):
     with conn_lock:
         r = conn.execute("SELECT lon,lat,type FROM geocode_cache WHERE key=?", (key,)).fetchone()
     if r: return float(r[0]), float(r[1]), str(r[2])
     return None
-
 def geocode_cache_put(key:str, lon:float, lat:float, typ:str):
     with conn_lock, conn:
         conn.execute("INSERT OR REPLACE INTO geocode_cache VALUES (?,?,?,?,datetime('now'))", (key, lon, lat, typ))
@@ -212,14 +244,14 @@ def rule_extract(it: IncidentItem) -> Dict:
     for c in CITY_NAMES:
         if c in t: muni = c; break
     places = []
-    for hint in FACILITY_HINT:
+    for hint in ["小学校","中学校","高校","大学","学校","グラウンド","体育館","公園","駅","港","病院","交差点"]:
         places += re.findall(rf"([\w\u3040-\u30ff\u4e00-\u9fffA-Za-z0-9]+{hint})", t)[:2]
     s = re.sub(r"\s+", " ", it.body).strip()
     s = s[:120] + ("…" if len(s)>120 else "")
     return {"category":cat,"municipality":muni,"place_strings":list(dict.fromkeys(places))[:3],
             "summary": s or it.heading, "date": it.incident_date}
 
-# ===== Gazetteer =====
+# ===== Gazetteer（外部CSVは任意） =====
 @st.cache_resource
 def load_gazetteer(path:str) -> Optional[pd.DataFrame]:
     try:
@@ -244,7 +276,7 @@ class GazetteerIndex:
             r = self.df.iloc[hit[2]]; return float(r["lon"]), float(r["lat"]), str(r["type"])  # type: ignore
         return None
 
-# ===== Nominatim =====
+# ===== Nominatim（任意・失敗時は内蔵市町へ） =====
 def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[float,float]]:
     try:
         q = f"{name} {municipality or ''} 愛媛県 日本".strip()
@@ -266,14 +298,11 @@ def nominatim_geocode(name:str, municipality:Optional[str]) -> Optional[Tuple[fl
 def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
     if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)  # v3
     return h3.latlng_to_cell(lat, lon, res)  # v4
-
 def h3_latlng_from_cell(cell: str) -> Tuple[float,float]:
     if hasattr(h3, "h3_to_geo"): lat, lon = h3.h3_to_geo(cell); return lat, lon  # v3
     lat, lon = h3.cell_to_latlng(cell); return lat, lon  # v4
-
 def h3_res_from_zoom(zoom_val:int) -> int:
     return {7:5,8:6,9:7,10:8,11:9,12:9,13:10,14:10}.get(zoom_val, 8)
-
 def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
     res = h3_res_from_zoom(zoom_val)
     groups: Dict[str, List[Dict]] = {}
@@ -288,11 +317,10 @@ def cluster_points(df: pd.DataFrame, zoom_val:int) -> List[Dict]:
         centers.append({"cell":cell, "lon":lon, "lat":lat, "count":len(rows), "rows":rows})
     return centers
 
-# ===== 表示用テキスト =====
+# ===== 表示テキスト =====
 def short_summary(s: str, max_len: int = 64) -> str:
     s = re.sub(r"\s+", " ", s or "").strip()
     return (s[:max_len] + ("…" if len(s) > max_len else "")) if s else ""
-
 def make_prediction(category:str, muni:Optional[str]) -> str:
     if category == "詐欺":       return "SNSや投資の誘いに注意。送金前に家族や警察へ相談。"
     if category == "交通事故":   return "夕方や雨天の交差点で増えやすい。横断と右左折に注意。"
@@ -313,13 +341,19 @@ for it in raw_items:
     ex["heading"] = it.heading
     extracted.append(ex)
 
-# ガゼッティア（オプショナル）
+# 外部ガゼッティア（任意）
 gdf = load_gazetteer("data/gazetteer_ehime.csv")
 idx = GazetteerIndex(gdf) if gdf is not None else None
 
-# 座標決定（ガゼッティア→Nominatim→県庁）
+# ---- 座標決定順序（堅牢化）----
+# 1) 外部ガゼッティア
+# 2) 内蔵市町中心（MUNI_CENTERS）
+# 3) Nominatim（施設→市町）
+# 4) 最終フォールバック：県庁
 def resolve_one(ex: Dict) -> Dict:
     muni = ex.get("municipality"); places = ex.get("place_strings") or []
+
+    # 1) 外部ガゼッティア
     if idx is not None:
         for ptxt in places:
             hit = idx.search(ptxt, 78)
@@ -327,12 +361,23 @@ def resolve_one(ex: Dict) -> Dict:
         if muni:
             hit = idx.search(muni, 78)
             if hit: lon, lat, typ = hit; return {"lon":lon, "lat":lat, "type":typ}
+
+    # 2) 内蔵市町中心（まずこれで確実に市町へ落とす）
+    if muni and muni in MUNI_CENTERS:
+        lon, lat = MUNI_CENTERS[muni]
+        return {"lon":lon, "lat":lat, "type":"city"}
+
+    # 3) Nominatim（任意・成功すれば上書き精度アップ）
     if muni:
+        # 施設優先
         for ptxt in places:
             ll = nominatim_geocode(ptxt, muni)
             if ll: return {"lon":ll[0], "lat":ll[1], "type":"facility"}
+        # 市町センター
         ll = nominatim_geocode(muni, None)
         if ll: return {"lon":ll[0], "lat":ll[1], "type":"city"}
+
+    # 4) 県庁
     return {"lon":EHIME_PREF_LON, "lat":EHIME_PREF_LAT, "type":"pref"}
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as exctr:
@@ -342,7 +387,7 @@ rows: List[Dict] = []
 for ex, loc in zip(extracted, results):
     typ = loc.get("type","city")
     base_radius = {"facility":300,"intersection":250,"town":600,"chome":600,"oaza":900,"aza":900,"city":2000,"pref":2500}.get(typ, 1200)
-    radius = int(base_radius * FUTURE_BUFFER_SCALE)  # 将来影響を見込んで拡大
+    radius = int(base_radius * FUTURE_BUFFER_SCALE)
     rows.append({
         "lon": float(loc["lon"]), "lat": float(loc["lat"]),
         "category": ex["category"],
@@ -355,22 +400,23 @@ for ex, loc in zip(extracted, results):
 
 df = pd.DataFrame(rows)
 
-# ===== カテゴリ色・アイコン（簡易） =====
+# ===== カテゴリ色（ライト/ダーク両対応・高コントラスト） =====
+# 背景が暗い時も明るい時も埋もれにくい色を選択（彩度を抑え目＋輝度差を確保）
 CAT_STYLE = {
-    "交通事故": {"color":[255, 99, 99, 230],  "radius":86, "icon":"▲"},
-    "火災":     {"color":[255, 140, 66, 230], "radius":88, "icon":"🔥"},
-    "死亡事案": {"color":[197, 128, 255, 230],"radius":92, "icon":"✖"},
-    "窃盗":     {"color":[98, 165, 255, 230], "radius":78, "icon":"🔓"},
-    "詐欺":     {"color":[70, 205, 180, 230], "radius":78, "icon":"⚠"},
-    "事件":     {"color":[255, 210, 64, 230], "radius":82, "icon":"！"},
-    "その他":   {"color":[130, 150, 166, 210], "radius":70, "icon":"・"},
+    "交通事故": {"color":[220, 60, 60, 235],   "radius":86, "icon":"▲"},
+    "火災":     {"color":[245, 130, 50, 235],  "radius":88, "icon":"🔥"},
+    "死亡事案": {"color":[170, 120, 240, 235], "radius":92, "icon":"✖"},
+    "窃盗":     {"color":[70, 150, 245, 235],  "radius":78, "icon":"🔓"},
+    "詐欺":     {"color":[40, 180, 160, 235],  "radius":78, "icon":"⚠"},
+    "事件":     {"color":[245, 200, 60, 235],  "radius":82, "icon":"！"},
+    "その他":   {"color":[128, 144, 160, 220], "radius":70, "icon":"・"},
 }
 
 # ===== 可視データ・クラスタ =====
-vis_df = df  # カテゴリトグルは維持可能だがUI簡素化のため全表示（必要なら再導入可）
+vis_df = df
 centers = cluster_points(vis_df, ZOOM_LIKE) if not vis_df.empty else []
 
-# ===== レイヤ用データ構築 =====
+# ===== レイヤデータ作成 =====
 def spiderfy(clon: float, clat: float, n: int, base_px: int = 16, gap_px: int = 8):
     out = []; rpx = base_px
     for k in range(n):
@@ -402,20 +448,19 @@ for c in centers:
             })
             icon_labels.append({"position":[lon,lat], "label":sty["icon"], "tcolor":[255,255,255,235], "offset":[0,-2]})
             if len(mini_labels_fg) < MAX_LABELS:
-                vtxt = (row["summary"] or "")[:4]
-                vtxt = "\n".join(list(vtxt))
+                vtxt = (row["summary"] or "")[:4]; vtxt = "\n".join(list(vtxt))
                 offset_px = int(-14*LABEL_SCALE)
                 mini_labels_bg.append({"position":[lon,lat],"label":vtxt,"tcolor":[0,0,0,220],"offset":[0,offset_px]})
                 mini_labels_fg.append({"position":[lon,lat],"label":vtxt,"tcolor":[255,255,255,235],"offset":[0,offset_px]})
             polys.append({"lon":lon,"lat":lat,"r":int(row.get("radius_m",600))})
     else:
-        points.append({"position":[clon,clat],"color":[90,90,90,200],"radius":70,"c":f"{cnt}件","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎"})
+        points.append({"position":[clon,clat],"color":[100,100,100,210],"radius":70,"c":f"{cnt}件","s":"周辺に多数","m":"","pred":"","src":EHIME_POLICE_URL,"r":0,"ico":"◎"})
         icon_labels.append({"position":[clon,clat], "label":"◎", "tcolor":[255,255,255,230], "offset":[0,-2]})
         if len(mini_labels_fg) < MAX_LABELS:
             mini_labels_bg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[0,0,0,220],"offset":[0,-12]})
             mini_labels_fg.append({"position":[clon,clat],"label":str(cnt),"tcolor":[255,255,255,235],"offset":[0,-12]})
 
-# 近似円（概位置）
+# === 近似円 ===
 def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64):
     coords = []
     r_earth = 6378137.0
@@ -447,11 +492,10 @@ with col_map:
     }
     TILE = TILESETS.get(map_choice, TILESETS["GSI 淡色"])
 
-    # 3D/2D 切替
     is_3d = (mode_3d == "3D")
     hex_layer = pdk.Layer(
         "HexagonLayer",
-        data=[{"position":x["position"],"count":x["count"]} for x in hex_points],
+        data=[{"position":x["position"],"count":x["count"]} for x in [{"position":[c["lon"],c["lat"]],"count":c["count"]} for c in centers]],
         get_position="position",
         get_elevation_weight="count",
         elevation_scale=10 if is_3d else 5,
@@ -467,7 +511,7 @@ with col_map:
         pdk.Layer("TileLayer", data=TILE["url"], min_zoom=0, max_zoom=TILE.get("max_zoom",18), tile_size=256, opacity=1.0),
         hex_layer,
         pdk.Layer("GeoJsonLayer", data=geojson, pickable=False, stroked=True, filled=True,
-                  get_line_width=2, get_line_color=[0,224,255], get_fill_color=[0,224,255,40], auto_highlight=False),
+                  get_line_width=2, get_line_color=[0,160,220], get_fill_color=[0,160,220,40], auto_highlight=False),
         pdk.Layer("ScatterplotLayer", data=points, get_position="position", get_fill_color="color", get_radius="radius",
                   pickable=True, radius_min_pixels=3, radius_max_pixels=60),
         pdk.Layer("TextLayer", data=icon_labels, get_position="position", get_text="label", get_color="tcolor",
@@ -482,7 +526,7 @@ with col_map:
         "html": "<b>{c}</b><br/>{s}<br/>{m}<br/>予測: {pred}<br/><a href='{src}' target='_blank'>出典</a>",
         "style": {"backgroundColor":"rgba(10,15,20,.96)","color":"#e6f1ff","maxWidth":"280px","whiteSpace":"normal",
                   "wordBreak":"break-word","lineHeight":1.4,"fontSize":"12px","padding":"10px 12px",
-                  "borderRadius":"12px","border":"1px solid #2b3a4d","boxShadow":"0 8px 32px rgba(0,224,255,.15)"}
+                  "borderRadius":"12px","border":"1px solid var(--border)"}
     }
 
     initial_view = pdk.ViewState(
@@ -491,7 +535,6 @@ with col_map:
     deck = pdk.Deck(layers=layers, initial_view_state=initial_view, tooltip=tooltip, map_provider=None, map_style=None)
     st.pydeck_chart(deck, use_container_width=True, height=560)
 
-    # 凡例
     legend_items = []
     for k, v in CAT_STYLE.items():
         rgba = f"rgba({v['color'][0]}, {v['color'][1]}, {v['color'][2]}, {v['color'][3]/255:.9f})"
@@ -513,13 +556,13 @@ with col_feed:
 
     html_list = ["<div class='feed-scroll'>"]
     for _, r in view.iterrows():
-        cat = r.get('category',''); icon = CAT_STYLE.get(cat, CAT_STYLE["その他"])["icon"]
+        cat = r.get('category','')
         html_list.append("<div class='feed-card'>")
-        html_list.append(f"<div><b>{icon} {cat}</b></div>")
+        html_list.append(f"<div><b>{cat}</b></div>")
         html_list.append(f"<div>{r.get('summary','')}</div>")
         muni = r.get('municipality') or ''
         if muni: html_list.append(f"<div style='color:var(--muted);font-size:.9rem'>{muni}</div>")
-        html_list.append(f"<div style='color:#7cffd9;font-size:.9rem'>予測: {r.get('pred','')}</div>")
+        html_list.append(f"<div style='color:#00b894;font-size:.9rem'>予測: {r.get('pred','')}</div>")
         html_list.append(f"<div style='color:var(--muted);font-size:.9rem'><a href='{r.get('src')}' target='_blank'>出典</a></div>")
         html_list.append("</div>")
     html_list.append("</div>")
