@@ -111,7 +111,7 @@ st.markdown("""
 
 st.markdown(
     "<div class='topbar'><div class='brand'><div class='id'>ES</div>"
-    f"<div><div>{APP_TITLE}</div><div class='subnote'>今に強い・先を読む。地図で一目、要点は簡潔。</div></div>"
+    f"<div><div>{APP_TITLE}</div><div class='subnote'>Save Your Self</div></div>"
     "</div></div>", unsafe_allow_html=True
 )
 
