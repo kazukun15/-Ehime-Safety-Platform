@@ -114,6 +114,51 @@ st.markdown(
     f"<div><div>{APP_TITLE}</div><div class='subnote'>Save Your Self</div></div>"
     "</div></div>", unsafe_allow_html=True
 )
+# === ニュース・ティッカー（トップバー直下に設置） ===
+def build_ticker_items(incidents_df: pd.DataFrame, jartic_points: List[Dict], tlabel: Optional[str]) -> List[str]:
+    items: List[str] = []
+    # 1) 県警速報（最新順に先頭数件）
+    for _, r in incidents_df.head(12).iterrows():
+        cat = r.get("category","")
+        muni = r.get("municipality","") or ""
+        s = r.get("summary","")
+        if s:
+            items.append(f"{muni} {s}")
+    # 2) JARTIC要旨（多量順に先頭数件）
+    if jartic_points and tlabel:
+        top = sorted(jartic_points, key=lambda p: p.get("total",0), reverse=True)[:8]
+        for p in top:
+            total, up, down = p.get("total",0), p.get("up",0), p.get("down",0)
+            items.append(f"【交通量 {tlabel}】合計{total}台/5分（↑{up} / ↓{down}）")
+    return items
+
+def render_ticker_html(lines: List[str]) -> None:
+    if not lines: return
+    text = "　｜　".join(lines)  # 区切り
+    st.markdown("""
+    <style>
+      .ticker-wrap{ position:sticky; top:58px; z-index:9; margin:-12px -16px 10px -16px;
+                    background:var(--panel2); border-bottom:1px solid var(--border); overflow:hidden; }
+      .ticker{ display:inline-block; white-space:nowrap; padding:6px 0; animation: ticker-move 28s linear infinite; }
+      .ticker:hover{ animation-play-state: paused; }
+      @keyframes ticker-move {
+        0%{ transform: translateX(100%); }
+        100%{ transform: translateX(-100%); }
+      }
+      @media (prefers-reduced-motion: reduce){
+        .ticker{ animation: none; }
+      }
+    </style>
+    """, unsafe_allow_html=True)
+    st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{text}</div></div>", unsafe_allow_html=True)
+
+# ▼ 既存のJARTIC取得後の場所で呼ぶ（j_points, tlabel が揃った段階）
+# 例：col_map内でレイヤ組み立てた後に
+ticker_lines = build_ticker_items(df, j_points, tlabel)
+render_ticker_html(ticker_lines)
+
+# ▼ 自動更新（任意）：5分に1回リロード
+st.autorefresh(interval=5*60*1000, key="ticker_refresh")
 
 # ----------------------------------------------------------------------------
 # Session state
