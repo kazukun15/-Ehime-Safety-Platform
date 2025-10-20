@@ -1,8 +1,14 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム v9.9-A6 (ticker fix)
+# 愛媛セーフティ・プラットフォーム v9.9-A7 (ticker fix: streamlit-autorefresh)
 # - ニュースティッカー: 県警速報＋JARTIC上位要約をトップバー直下に表示
-# - NameError修正：JARTICを地図レンダ前に取得してティッカーに供給、地図側は結果を再利用
+# - 自動更新: streamlit-autorefresh の st_autorefresh() を使用
 # - 既存: JARTIC点/線、OSMスナップ(0〜10km)、危険交差点ON/OFF、県警速報→位置推定 等
+#
+# 依存:
+#   pip install streamlit pydeck pandas requests httpx beautifulsoup4 rapidfuzz h3 streamlit-autorefresh
+#
+# 題名: 愛媛セーフティ・プラットフォーム
+# サブ: Save Your Self
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -19,6 +25,7 @@ import pydeck as pdk
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
 import h3
+from streamlit_autorefresh import st_autorefresh  # ★ 自動更新
 
 # === Gemini (optional) ===
 try:
@@ -27,9 +34,10 @@ try:
 except Exception:
     _HAS_GEMINI = False
 
-APP_TITLE = "愛媛セーフティ・プラットフォーム / Ehime Safety Platform"
+APP_TITLE = "愛媛セーフティ・プラットフォーム"
+SUBTITLE = "Save Your Self"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A6 (ticker+snap_subpath_0_10km)"
+USER_AGENT = "ESP/9.9-A7 (ticker+st_autorefresh+snap_subpath_0_10km)"
 TIMEOUT = 15
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -78,7 +86,7 @@ TILESETS: Dict[str, Dict] = {
 # ----------------------------------------------------------------------------
 # UI / CSS
 # ----------------------------------------------------------------------------
-st.set_page_config(page_title="Ehime Safety Platform", layout="wide")
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.markdown("""
 <style>
   :root{ --bg:#0b0f14; --panel:#0f141b; --panel2:#121924; --text:#e8f1ff; --muted:#8aa0b6; --border:#2b3a4d; --a:#007aff; --b:#00b894; }
@@ -116,7 +124,7 @@ st.markdown("""
 
 st.markdown(
     "<div class='topbar'><div class='brand'><div class='id'>ES</div>"
-    f"<div><div>{APP_TITLE}</div><div class='subnote'>今に強い・先を読む。地図で一目、要点は簡潔。</div></div>"
+    f"<div><div>{APP_TITLE}</div><div class='subnote'>{SUBTITLE}</div></div>"
     "</div></div>", unsafe_allow_html=True
 )
 
@@ -674,7 +682,7 @@ hot_df["rgba"] = hot_df["count"].apply(_cfc)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)
 
 # ----------------------------------------------------------------------------
-# ★ ここでJARTICを一度だけ取得 → ティッカーに利用、地図でも再利用（NameError回避）
+# ★ ここでJARTICを一度だけ取得 → ティッカーに利用、地図でも再利用
 # ----------------------------------------------------------------------------
 gj_prefetch, tlabel_prefetch = fetch_jartic_5min(EHIME_BBOX)
 j_points_prefetch: List[Dict] = jartic_features_to_points(gj_prefetch, tlabel_prefetch) if (gj_prefetch and tlabel_prefetch) else []
@@ -699,8 +707,8 @@ def render_ticker_html(lines: List[str]) -> None:
 # トップバー直下でティッカーを描画（NameErrorのない安全な順序）
 ticker_lines = build_ticker_items(df, j_points_prefetch, tlabel_prefetch)
 render_ticker_html(ticker_lines)
-# 必要なら自動更新（5分毎）
-st.autorefresh(interval=5*60*1000, key="ticker_refresh")
+# ★ 自動更新（5分ごとに再実行）
+st_autorefresh(interval=5*60*1000, key="ticker_refresh")
 
 # ----------------------------------------------------------------------------
 # Sidebar
@@ -745,7 +753,6 @@ col_map, col_feed = st.columns([7,5], gap="large")
 with col_map:
     is_3d = (mode_3d == "3D")
 
-    # ベース／ヒート／事故グリッド
     def build_base_layers(map_choice:str, custom_tile:str) -> List[pdk.Layer]:
         tile = TILESETS.get(map_choice, TILESETS["標準"])
         layers: List[pdk.Layer] = [pdk.Layer(
@@ -781,7 +788,6 @@ with col_map:
                               [230,60,60,150],[200,40,40,190],[180,20,20,220],
                           ])]
 
-    # 事故点/ラベル/バッファ
     def circle_coords(lon: float, lat: float, radius_m: int = 300, n: int = 64) -> List[List[float]]:
         out: List[List[float]] = []
         r_earth = 6378137.0
