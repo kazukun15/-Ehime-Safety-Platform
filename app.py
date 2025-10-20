@@ -115,7 +115,7 @@ st.markdown("""
   /* ticker */
   .ticker-wrap{ position:sticky; top:58px; z-index:9; margin:-12px -16px 10px -16px;
                 background:var(--panel2); border-bottom:1px solid var(--border); overflow:hidden; }
-  .ticker{ display:inline-block; white-space:nowrap; padding:6px 0; animation: ticker-move 28s linear infinite; }
+  .ticker{ display:inline-block; white-space:nowrap; padding:6px 0; animation: ticker-move 45s linear infinite; }
   .ticker:hover{ animation-play-state: paused; }
   @keyframes ticker-move { 0%{ transform: translateX(100%);} 100%{ transform: translateX(-100%);} }
   @media (prefers-reduced-motion: reduce){ .ticker{ animation: none; } }
