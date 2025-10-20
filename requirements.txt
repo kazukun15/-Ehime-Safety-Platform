@@ -5,4 +5,5 @@ requests
 beautifulsoup4
 rapidfuzz
 h3
-google-generativeai>=0.8.0   # 任意（未設定でもOK）
+google-generativeai  # 任意（未設定でもOK）
+httpx
