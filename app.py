@@ -2,7 +2,7 @@
 # 愛媛セーフティ・プラットフォーム v9.9-A4
 # - ツールチップを {info_html} のみに統一（未展開の {c}{s}{m}{pred} を排除）
 # - JARTIC 点・線ホバー：時刻（JST）・合計・上り・下り
-# - 擬似渋滞線の長さを 300m〜1000m に動的拡張（交通量に応じて）
+# - 擬似渋滞線の長さを 30m〜10000m に動的拡張（交通量に応じて）
 # - 既存機能維持：速報→位置推定、交差点ヒート/3D柱 ON/OFF、JARTIC 点、擬似線、フェールセーフ、フィード 等
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
@@ -30,7 +30,7 @@ except Exception:
 
 APP_TITLE = "愛媛セーフティ・プラットフォーム"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A4 (info_html+line300-1000)"
+USER_AGENT = "ESP/9.9-A4 (info_html+line30-10000)"
 TIMEOUT = 15
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -498,10 +498,10 @@ def _nearest_on_segment(p: Tuple[float,float], a: Tuple[float,float], b: Tuple[f
 
 @st.cache_data(ttl=180)
 def build_snap_lines(j_points: List[Dict], roads: List[List[List[float]]],
-                     base_min: int = 30, base_max: int = 100000, thresh_m: int = 220) -> List[Dict]:
+                     base_min: int = 30, base_max: int = 10000, thresh_m: int = 220) -> List[Dict]:
     """
-    交通量に応じて線長を 300m〜1000m に自動調整。
-      length_m = base_min + min(base_max-base_min, jt_total*2)  # total>=350で約1km
+    交通量に応じて線長を 30m〜10000m に自動調整。
+      length_m = base_min + min(base_max-base_min, jt_total*2)  # total>=500で約10km
     道路が遠い/無い場合は東西短線（同じ長さ）でフェールセーフ。
     """
     out: List[Dict] = []
