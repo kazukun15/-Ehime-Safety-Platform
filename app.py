@@ -1,14 +1,11 @@
 # -*- coding: utf-8 -*-
-# 愛媛セーフティ・プラットフォーム v9.9-A7 (ticker fix: streamlit-autorefresh)
-# - ニュースティッカー: 県警速報＋JARTIC上位要約をトップバー直下に表示
-# - 自動更新: streamlit-autorefresh の st_autorefresh() を使用
-# - 既存: JARTIC点/線、OSMスナップ(0〜10km)、危険交差点ON/OFF、県警速報→位置推定 等
+# 愛媛セーフティ・プラットフォーム v9.9-A8 (ticker: seamless loop)
+# - トップの電光掲示板を無限ループ化（シームレス）
+# - 速度は 45s（CSSの animation-duration を変更すれば調整可）
+# - 既存機能維持：JARTIC点/線、OSMスナップ(0〜10km)、危険交差点ON/OFF、県警速報→位置推定 等
 #
 # 依存:
 #   pip install streamlit pydeck pandas requests httpx beautifulsoup4 rapidfuzz h3 streamlit-autorefresh
-#
-# 題名: 愛媛セーフティ・プラットフォーム
-# サブ: Save Your Self
 
 import os, re, math, time, json, sqlite3, threading, unicodedata, hashlib
 from dataclasses import dataclass
@@ -25,7 +22,7 @@ import pydeck as pdk
 from bs4 import BeautifulSoup
 from rapidfuzz import fuzz, process as rf_process
 import h3
-from streamlit_autorefresh import st_autorefresh  # ★ 自動更新
+from streamlit_autorefresh import st_autorefresh
 
 # === Gemini (optional) ===
 try:
@@ -37,7 +34,7 @@ except Exception:
 APP_TITLE = "愛媛セーフティ・プラットフォーム"
 SUBTITLE = "Save Your Self"
 EHIME_POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
-USER_AGENT = "ESP/9.9-A7 (ticker+st_autorefresh+snap_subpath_0_10km)"
+USER_AGENT = "ESP/9.9-A8 (ticker_loop+snap_subpath_0_10km)"
 TIMEOUT = 15
 TTL_HTML = 600
 MAX_WORKERS = 6
@@ -112,13 +109,21 @@ st.markdown("""
   @media (prefers-color-scheme: light){ .hud .badge{ background:rgba(255,255,255,.9); color:#0f2230; } }
   .jartic-grad { height: 10px; border-radius:6px; background: linear-gradient(90deg, #3c78c8, #4ec67a, #f0d438, #e63c3c); }
   .redline-sample { height: 0; border-top:4px solid #e60000; width: 80px; border-radius:2px; }
-  /* ticker */
+
+  /* ★ Seamless ticker (loop) */
   .ticker-wrap{ position:sticky; top:58px; z-index:9; margin:-12px -16px 10px -16px;
                 background:var(--panel2); border-bottom:1px solid var(--border); overflow:hidden; }
-  .ticker{ display:inline-block; white-space:nowrap; padding:6px 0; animation: ticker-move 28s linear infinite; }
+  .ticker{ display:flex; gap:60px; white-space:nowrap; padding:6px 0;
+           will-change: transform; animation: ticker-move 45s linear infinite; }
   .ticker:hover{ animation-play-state: paused; }
-  @keyframes ticker-move { 0%{ transform: translateX(100%);} 100%{ transform: translateX(-100%);} }
-  @media (prefers-reduced-motion: reduce){ .ticker{ animation: none; } }
+  .ticker-seq{ display:inline-block; }
+  @keyframes ticker-move {
+    0%   { transform: translateX(0); }
+    100% { transform: translateX(-50%); } /* 2列分のうち半分だけ左へ → 途切れず無限ループ */
+  }
+  @media (prefers-reduced-motion: reduce){
+    .ticker{ animation: none; }
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -321,7 +326,7 @@ def gemini_candidates(full_text: str, muni_hint: Optional[str]) -> List[Dict]:
     return []
 
 # ----------------------------------------------------------------------------
-# H3 helpers & presentation helpers
+# H3 & helpers
 # ----------------------------------------------------------------------------
 def h3_cell_from_latlng(lat: float, lon: float, res: int) -> str:
     if hasattr(h3, "geo_to_h3"): return h3.geo_to_h3(lat, lon, res)
@@ -459,7 +464,7 @@ def color_from_total(total:int) -> List[int]:
     return [r,g,b, 230]
 
 def size_from_total(total:int) -> int:
-    return 48 + int(min(260, total * 0.9))
+    return 52 + int(min(260, total * 0.9))
 
 # ----------------------------------------------------------------------------
 # OSM（Overpass）＆擬似渋滞線（赤）0〜10km：ウェイに沿ったサブパス抽出
@@ -569,7 +574,6 @@ def build_snap_lines(j_points: List[Dict], ways: List[Dict],
     out: List[Dict] = []
     if not j_points: return out
     RED = [230, 0, 0, 235]
-
     for jp in j_points:
         lon, lat = jp["position"]; p = (lon, lat)
         total = int(jp.get("total", jp.get("jt_total", 0)))
@@ -682,10 +686,11 @@ hot_df["rgba"] = hot_df["count"].apply(_cfc)
 hot_df["elev"] = hot_df["count"].apply(lambda c: 300 + (c-1)*220)
 
 # ----------------------------------------------------------------------------
-# ★ ここでJARTICを一度だけ取得 → ティッカーに利用、地図でも再利用
+# JARTICデータ（prefetch）→ ティッカーにも利用
 # ----------------------------------------------------------------------------
 gj_prefetch, tlabel_prefetch = fetch_jartic_5min(EHIME_BBOX)
-j_points_prefetch: List[Dict] = jartic_features_to_points(gj_prefetch, tlabel_prefetch) if (gj_prefetch and tlabel_prefetch) else []
+j_points_prefetch: List[Dict] = (jartic_features_to_points(gj_prefetch, tlabel_prefetch)
+                                 if (gj_prefetch and tlabel_prefetch) else [])
 
 def build_ticker_items(incidents_df: pd.DataFrame, jpts: List[Dict], tlabel: Optional[str]) -> List[str]:
     items: List[str] = []
@@ -701,13 +706,22 @@ def build_ticker_items(incidents_df: pd.DataFrame, jpts: List[Dict], tlabel: Opt
 
 def render_ticker_html(lines: List[str]) -> None:
     if not lines: return
+    # 同じシーケンスを2回並べて、translateX(-50%) の無限ループで切れ目なく流す
     text = "　｜　".join(lines)
-    st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{text}</div></div>", unsafe_allow_html=True)
+    html = (
+        "<div class='ticker-wrap'>"
+        "  <div class='ticker'>"
+        f"    <span class='ticker-seq'>{text}</span>"
+        f"    <span class='ticker-seq' aria-hidden='true'>{text}</span>"
+        "  </div>"
+        "</div>"
+    )
+    st.markdown(html, unsafe_allow_html=True)
 
-# トップバー直下でティッカーを描画（NameErrorのない安全な順序）
+# ★ ティッカー描画（最上部）
 ticker_lines = build_ticker_items(df, j_points_prefetch, tlabel_prefetch)
 render_ticker_html(ticker_lines)
-# ★ 自動更新（5分ごとに再実行）
+# 自動更新（5分ごと）
 st_autorefresh(interval=5*60*1000, key="ticker_refresh")
 
 # ----------------------------------------------------------------------------
@@ -867,8 +881,6 @@ with col_map:
 
     # --- JARTIC（prefetch済みデータを利用） ---
     j_points = j_points_prefetch
-    tlabel  = tlabel_prefetch
-
     if st.session_state.show_jartic_points and j_points:
         pts_vis = [{
             "position": p["position"],
