@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-愛媛セーフティ・プラットフォーム (ESP) - Vertical Layout Edition
-Version: 18.0
+愛媛セーフティ・プラットフォーム (ESP) - HTML Rendering Fix Edition
+Version: 19.0
 Author: World Class Program Designer
-Description: 地図とニュースリストを縦に配置した一覧性重視のレイアウト
+Description: HTML描画バグ修正（Minify処理追加）、地図表示安定化、スマホ最適化完全版
 """
 
 import math
 import re
-import time
-import textwrap
 import random
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -34,15 +32,15 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 class AppConfig:
     TITLE = "愛媛セーフティ・プラットフォーム"
-    SUBTITLE = "Safety Dashboard v18.0"
-    USER_AGENT = "ESP/18.0-Vertical"
-    TIMEOUT = 8
+    SUBTITLE = "Safety Dashboard v19.0"
+    USER_AGENT = "ESP/19.0-Fix"
+    TIMEOUT = 5
     MAX_WORKERS = 4
     
     # 愛媛県中心座標
     EHIME_LAT = 33.8390
     EHIME_LON = 132.7650
-    INIT_ZOOM = 9
+    INIT_ZOOM = 10
 
     # API Endpoints
     POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
@@ -71,6 +69,7 @@ class AppConfig:
         "その他":   {"color": [100, 100, 100, 200], "radius": 100, "icon": "・", "base_risk": 20},
     }
 
+    # タイルセット（APIキー不要なものを厳選）
     TILESETS = {
         "標準 (OSM)": {"url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "max_zoom": 19},
         "Googleマップ (道路)": {"url": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}", "max_zoom": 20},
@@ -89,61 +88,77 @@ class AppConfig:
 久米交差点,33.8143,132.7957,4,松山市久米"""
 
 # ==============================================================================
-# [UI/CSS] スタイリッシュデザイン
+# [Helper] HTML整形関数 (ここが修正の肝です)
+# ==============================================================================
+def clean_html(html_str: str) -> str:
+    """
+    HTML文字列から改行と余分な空白を除去し、1行にします。
+    これにより、Markdownがインデントをコードブロックとして誤認識するのを防ぎます。
+    """
+    # 改行をスペースに置換
+    s = html_str.replace("\n", " ")
+    # 連続するスペースを1つに置換
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+# ==============================================================================
+# [UI/CSS] デザイン
 # ==============================================================================
 def inject_css():
     st.markdown("""
     <style>
-      :root{ --bg: #f4f7f9; --card: #ffffff; --text: #333; --muted: #666; --accent: #0984e3; --border: #dfe6e9; }
-      .stApp { background-color: var(--bg); color: var(--text); font-family: 'Helvetica Neue', Arial, sans-serif; }
+      :root{ --bg: #f8f9fa; --card: #ffffff; --text: #212529; --muted: #6c757d; --accent: #0d6efd; --border: #dee2e6; }
+      .stApp { background-color: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
       a { color: var(--accent) !important; text-decoration: none; }
       
       /* セクションヘッダー */
       .section-header {
-        font-size: 1.2rem; font-weight: 800; color: var(--text); margin: 24px 0 12px 0;
+        font-size: 1.1rem; font-weight: 700; color: var(--text); margin: 20px 0 10px 0;
         display: flex; align-items: center; gap: 8px;
-        border-left: 5px solid var(--accent); padding-left: 10px;
+        border-left: 4px solid var(--accent); padding-left: 12px; background: #fff; padding-top:8px; padding-bottom:8px; border-radius: 0 4px 4px 0;
       }
 
-      /* カード */
+      /* カード全体 */
       .feed-card {
-        background: var(--card); padding: 0; border-radius: 12px; border: 1px solid var(--border);
-        margin-bottom: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); overflow: hidden;
+        background: var(--card); padding: 0; border-radius: 8px; border: 1px solid var(--border);
+        margin-bottom: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); overflow: hidden;
       }
       .feed-content { padding: 16px; }
       
-      .feed-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-      .feed-title { font-weight: 800; font-size: 1.05rem; display:flex; align-items:center; gap:6px; color: #2d3436; }
-      .feed-loc { font-size: 0.75rem; background: #f1f2f6; padding: 4px 10px; border-radius: 20px; color: #636e72; font-weight: 600; letter-spacing: 0.5px;}
-      .feed-body { font-size: 0.95rem; line-height: 1.6; color: #636e72; margin-bottom: 12px; }
+      .feed-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+      .feed-title { font-weight: 700; font-size: 1rem; display:flex; align-items:center; gap:6px; color: var(--text); }
+      .feed-loc { font-size: 0.75rem; background: #e9ecef; padding: 2px 8px; border-radius: 4px; color: var(--muted); font-weight: 600; white-space: nowrap;}
+      .feed-body { font-size: 0.9rem; line-height: 1.5; color: #495057; margin-bottom: 12px; }
 
       /* 犯罪係数パネル */
       .coef-panel {
         background: #f8f9fa; padding: 12px 16px; border-top: 1px solid var(--border);
-        display: flex; flex-direction: column; gap: 8px;
       }
-      .coef-row-main { display: flex; justify-content: space-between; align-items: flex-end; }
-      .coef-label { font-size: 0.7rem; font-weight: 700; color: #b2bec3; letter-spacing: 1px; margin-bottom: 2px; }
-      .coef-val-box { text-align: right; line-height: 1; }
-      .coef-val { font-family: 'Courier New', monospace; font-weight: 900; font-size: 2.2rem; letter-spacing: -1px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-      .coef-level { font-size: 0.7rem; font-weight: 800; text-transform: uppercase; color: #b2bec3; }
+      .coef-label { font-size: 0.65rem; font-weight: 700; color: #adb5bd; letter-spacing: 0.5px; margin-bottom: 4px; }
+      .coef-row-main { display: flex; justify-content: space-between; align-items: center; gap: 12px;}
+      
+      .coef-val-box { text-align: right; line-height: 1; min-width: 60px;}
+      .coef-val { font-family: 'Courier New', monospace; font-weight: 800; font-size: 1.8rem; letter-spacing: -1px; }
+      .coef-level { font-size: 0.65rem; font-weight: 800; text-transform: uppercase; color: #adb5bd; margin-top: 2px;}
 
-      .meter-track { width: 100%; height: 6px; background: #dfe6e9; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+      .meter-track { width: 100%; height: 6px; background: #e9ecef; border-radius: 3px; overflow: hidden; margin-bottom: 8px; }
       .meter-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease-out; }
       
-      .coef-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
-      .coef-item { background: #fff; padding: 6px 10px; border-radius: 6px; border: 1px solid #eee; font-size: 0.8rem; display: flex; align-items: center; gap: 6px; color: #636e72; font-weight: 500; }
-      .coef-icon { font-size: 1rem; }
+      .coef-grid { display: flex; gap: 8px; flex-wrap: wrap; }
+      .coef-item { 
+        background: #fff; padding: 4px 8px; border-radius: 4px; border: 1px solid #dee2e6;
+        font-size: 0.75rem; display: flex; align-items: center; gap: 4px; color: var(--muted); font-weight: 500;
+      }
 
       .feed-link { text-align: right; padding: 8px 16px; background: #fff; border-top: 1px solid #f1f2f6;}
       
       /* ティッカー */
-      .ticker-wrap { background: #fff; border-bottom: 1px solid var(--border); border-top: 1px solid var(--border); padding: 8px 0; white-space: nowrap; overflow: hidden; margin-bottom: 10px;}
-      .ticker { display: inline-block; animation: ticker 50s linear infinite; }
+      .ticker-wrap { background: #fff; border-bottom: 1px solid var(--border); padding: 8px 0; white-space: nowrap; overflow: hidden; margin-bottom: 10px;}
+      .ticker { display: inline-block; animation: ticker 60s linear infinite; }
       @keyframes ticker { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
-      .ticker-item { margin-right: 32px; color: #2d3436; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; }
+      .ticker-item { margin-right: 32px; color: var(--text); font-size: 0.85rem; display: inline-flex; align-items: center; }
       
-      .map-tooltip { background: rgba(255,255,255,0.95) !important; color: #2d3436 !important; box-shadow: 0 4px 12px rgba(0,0,0,0.15) !important; border-radius: 8px !important; border:none !important;}
+      .map-tooltip { background: rgba(255,255,255,0.98) !important; color: #212529 !important; box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important; border-radius: 4px !important; border: 1px solid #dee2e6 !important;}
     </style>
     """, unsafe_allow_html=True)
 
@@ -189,17 +204,17 @@ def calculate_crime_coefficient(category: str, dt: datetime) -> Dict:
     
     reasons = []
     if moon["factor"] > 1.1: reasons.append(moon['name'])
-    if weather["di"] > 80: reasons.append("不快指数高")
+    if weather["di"] > 80: reasons.append("高不快指数")
     if time_factor > 1.1: reasons.append("深夜帯")
     if not reasons: reasons.append("平常")
     
-    color = "#2ecc71" # Normal
-    level = "Normal"
-    if coef > 60: color = "#f39c12"; level = "Caution"
-    if coef > 80: color = "#e74c3c"; level = "Critical"
+    color = "#198754" # Normal (Green)
+    level = "NORMAL"
+    if coef > 60: color = "#ffc107"; level = "CAUTION" # Yellow
+    if coef > 80: color = "#dc3545"; level = "CRITICAL" # Red
     
     return {
-        "score": int(coef), "color": color, "level": level, "reasons": "・".join(reasons),
+        "score": int(coef), "color": color, "level": level, "reasons": " ".join(reasons),
         "weather_text": f"{weather['temp']}℃ (不快指数{int(weather['di'])})", "moon_text": moon["name"]
     }
 
@@ -241,7 +256,7 @@ def build_snap_lines(jpoints: List[Dict], ways: List[Dict]) -> List[Dict]:
             vl = math.hypot(best_vec[0], best_vec[1])
             if vl > 0:
                 dx = (best_vec[0]/vl)*(length_m/111000); dy = (best_vec[1]/vl)*(length_m/111000)
-                lines.append({"path": [best_proj, [best_proj[0]+dx, best_proj[1]+dy]], "color": [255, 50, 50, 200], "width": 6 + min(12, total//80)})
+                lines.append({"path": [best_proj, [best_proj[0]+dx, best_proj[1]+dy]], "color": [220, 53, 69, 200], "width": 6 + min(12, total//80)})
     return lines
 
 # ==============================================================================
@@ -263,7 +278,7 @@ def generate_mock_incidents() -> List[Incident]:
     results = []
     for cat, body, muni in mock_data:
         lon, lat = AppConfig.CITY_DATA.get(muni, (AppConfig.EHIME_LON, AppConfig.EHIME_LAT))
-        lon += random.uniform(-0.02, 0.02); lat += random.uniform(-0.02, 0.02)
+        lon += random.uniform(-0.03, 0.03); lat += random.uniform(-0.03, 0.03)
         coef_data = calculate_crime_coefficient(cat, datetime.now())
         results.append(Incident(cat, body, muni, lon, lat, 
                        AppConfig.CAT_STYLE.get(cat, AppConfig.CAT_STYLE["その他"]), 
@@ -271,7 +286,7 @@ def generate_mock_incidents() -> List[Incident]:
     return results
 
 @st.cache_data(ttl=600)
-def fetch_police_data(days: int = 7) -> List[Incident]:
+def fetch_police_data() -> List[Incident]:
     try:
         r = requests.get(AppConfig.POLICE_URL, headers={"User-Agent": AppConfig.USER_AGENT}, timeout=AppConfig.TIMEOUT)
         if r.status_code != 200: return generate_mock_incidents()
@@ -297,7 +312,7 @@ def parse_incident(head: str, body: str) -> Incident:
     cat = next((k for k in AppConfig.CAT_STYLE if k in full), "その他")
     muni = next((k for k in AppConfig.CITY_DATA if k in full), "愛媛県")
     lon, lat = AppConfig.CITY_DATA.get(muni, (AppConfig.EHIME_LON, AppConfig.EHIME_LAT))
-    lon += random.uniform(-0.015, 0.015); lat += random.uniform(-0.015, 0.015)
+    lon += random.uniform(-0.02, 0.02); lat += random.uniform(-0.02, 0.02)
     coef_data = calculate_crime_coefficient(cat, datetime.now())
     return Incident(cat, body[:90]+"..." if len(body)>90 else body, muni, lon, lat, 
                     AppConfig.CAT_STYLE.get(cat, AppConfig.CAT_STYLE["その他"]), 
@@ -348,7 +363,7 @@ def main():
         show_jartic = st.toggle("交通情報", value=True)
         show_hotspots = st.toggle("危険交差点", value=True)
 
-    with st.spinner("Loading..."):
+    with st.spinner("データを取得中..."):
         with ThreadPoolExecutor(max_workers=AppConfig.MAX_WORKERS) as exe:
             f1 = exe.submit(fetch_police_data)
             f2 = exe.submit(fetch_jartic_data)
@@ -364,12 +379,14 @@ def main():
     for i in incidents[:5]:
         ticker_html += f"<span class='ticker-item'><b>{i.category}</b> {i.municipality} ({i.coef['score']})</span>"
     if show_jartic: ticker_html += "<span class='ticker-item' style='color:#0984e3'><b>JARTIC</b> 交通情報連携中</span>"
-    st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{ticker_html}</div></div>", unsafe_allow_html=True)
+    # ここでclean_htmlを使用
+    st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{clean_html(ticker_html)}</div></div>", unsafe_allow_html=True)
 
     # === MAP SECTION ===
     st.markdown("<div class='section-header'>🗺️ リアルタイム・セーフティマップ</div>", unsafe_allow_html=True)
     
     layers = []
+    # ★重要: TileLayerを確実に表示させるための設定
     tile = AppConfig.TILESETS[map_style]
     layers.append(pdk.Layer("TileLayer", data=tile["url"], min_zoom=0, max_zoom=tile["max_zoom"], opacity=1.0))
 
@@ -389,18 +406,28 @@ def main():
         df_inc["color"] = df_inc["style"].apply(lambda s: s["color"])
         df_inc["radius"] = df_inc["style"].apply(lambda s: s["radius"])
         df_inc["icon"] = df_inc["style"].apply(lambda s: s["icon"])
-        df_inc["tooltip"] = df_inc.apply(lambda r: f"""
+        
+        # ツールチップHTMLも整形
+        df_inc["tooltip"] = df_inc.apply(lambda r: clean_html(f"""
             <div style='font-family:sans-serif; padding:4px;'>
-            <div style='font-size:1.1em;font-weight:bold;margin-bottom:4px'>{r['icon']} {r['category']} <span style='font-size:0.8em;color:{r['coef']['color']}'>Lv.{r['coef']['score']}</span></div>
-            <div style='font-size:0.9em;color:#555'>{r['municipality']}</div>
-            <div style='margin-top:4px'>{r['summary'][:30]}</div>
-            </div>""".replace("\n", ""), axis=1)
+            <div style='font-size:1rem;font-weight:bold;margin-bottom:4px'>{r['icon']} {r['category']} <span style='font-size:0.8em;color:{r['coef']['color']}'>Lv.{r['coef']['score']}</span></div>
+            <div style='font-size:0.85em;color:#555'>{r['municipality']}</div>
+            <div style='margin-top:4px;font-size:0.9em'>{r['summary'][:30]}</div>
+            </div>"""), axis=1)
         layers.append(pdk.Layer("ScatterplotLayer", data=df_inc, get_position="[lon, lat]", get_fill_color="color", get_radius="radius", stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2, pickable=True))
 
     view_state = pdk.ViewState(latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON, zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0)
-    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"html": "{tooltip}", "style": {"color": "#333", "backgroundColor": "white"}}, map_provider=None, map_style=None), use_container_width=True, height=500)
+    
+    # ★重要: map_provider=None と map_style=None を指定してAPIキー不要化
+    st.pydeck_chart(pdk.Deck(
+        layers=layers, 
+        initial_view_state=view_state, 
+        tooltip={"html": "{tooltip}", "style": {"color": "#333", "backgroundColor": "white"}}, 
+        map_provider=None, 
+        map_style=None
+    ), use_container_width=True, height=500)
 
-    # === LIST SECTION ===
+    # === LIST SECTION (Vertical Layout) ===
     st.markdown("<div class='section-header'>🚨 発生事案ニュース & 犯罪係数</div>", unsafe_allow_html=True)
     
     q = st.text_input("検索", placeholder="キーワード (例: 事故, 松山市...)")
@@ -409,7 +436,8 @@ def main():
     html_buffer = ""
     for item in view_list:
         coef = item.coef
-        card = textwrap.dedent(f"""
+        # HTMLのインデントを気にせず書く（clean_htmlで後処理するため）
+        card_html = f"""
             <div class='feed-card'>
                 <div class='feed-content'>
                     <div class='feed-header'>
@@ -434,15 +462,16 @@ def main():
                         </div>
                         <div class='coef-val-box'>
                             <div class='coef-val' style='color: {coef["color"]}'>{coef["score"]}</div>
-                            <div class='coef-level'>{coef["level"]}</div>
+                            <div class='coef-level' style='color: {coef["color"]}'>{coef["level"]}</div>
                         </div>
                     </div>
                 </div>
                 
                 <div class='feed-link'><a href='{item.src}' target='_blank'>詳細を確認 &rarr;</a></div>
             </div>
-        """)
-        html_buffer += card
+        """
+        # ★ここでHTMLを整形・圧縮
+        html_buffer += clean_html(card_html)
     
     if not view_list: st.info("情報はありません")
     else: st.markdown(html_buffer, unsafe_allow_html=True)
