@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-愛媛セーフティ・プラットフォーム (ESP) - Mobile Full Edition
-Version: 11.0
+愛媛セーフティ・プラットフォーム (ESP) - Mobile Full Edition (Light Theme)
+Version: 12.0
 Author: World Class Program Designer
-Description: 全機能搭載（JARTIC線/点、交差点3D、速報）かつスマホ最適化・バグ修正版
+Description: 全機能搭載、地図が見やすいライトテーマUI/UX刷新版
 """
 
 import math
@@ -29,15 +29,15 @@ from streamlit_autorefresh import st_autorefresh
 # ==============================================================================
 class AppConfig:
     TITLE = "愛媛セーフティ・プラットフォーム"
-    SUBTITLE = "Mobile Full Edition v11.0"
-    USER_AGENT = "ESP/11.0-Mobile"
+    SUBTITLE = "Light Theme v12.0"
+    USER_AGENT = "ESP/12.0-MobileLight"
     TIMEOUT = 10
     MAX_WORKERS = 4
     
     # 愛媛県中心座標
     EHIME_LAT = 33.8390
     EHIME_LON = 132.7650
-    INIT_ZOOM = 9  # スマホ向けに少し広域に
+    INIT_ZOOM = 9
 
     # Endpoints
     POLICE_URL = "https://www.police.pref.ehime.jp/sokuho/sokuho.htm"
@@ -55,15 +55,15 @@ class AppConfig:
         "宇和島市":(132.5600,33.2230),"八幡浜市":(132.4230,33.4620),
     }
 
-    # 地図スタイル設定
+    # 地図スタイル設定（配色調整）
     CAT_STYLE = {
-        "交通事故": {"color": [220, 60, 60, 255],   "radius": 150, "icon": "💥"},
-        "火災":     {"color": [245, 130, 50, 255],  "radius": 150, "icon": "🔥"},
-        "死亡事案": {"color": [128, 0, 128, 255],   "radius": 180, "icon": "🙏"},
-        "窃盗":     {"color": [70, 150, 245, 255],  "radius": 120, "icon": "🏃"},
-        "詐欺":     {"color": [40, 180, 160, 255],  "radius": 120, "icon": "⚠"},
-        "事件":     {"color": [245, 200, 60, 255],  "radius": 130, "icon": "⚡"},
-        "その他":   {"color": [128, 144, 160, 220], "radius": 100, "icon": "・"},
+        "交通事故": {"color": [230, 50, 50, 255],   "radius": 150, "icon": "💥"},
+        "火災":     {"color": [255, 100, 0, 255],   "radius": 150, "icon": "🔥"},
+        "死亡事案": {"color": [150, 0, 150, 255],   "radius": 180, "icon": "🙏"},
+        "窃盗":     {"color": [0, 120, 220, 255],   "radius": 120, "icon": "🏃"},
+        "詐欺":     {"color": [0, 160, 120, 255],   "radius": 120, "icon": "⚠"},
+        "事件":     {"color": [220, 180, 0, 255],   "radius": 130, "icon": "⚡"},
+        "その他":   {"color": [100, 100, 100, 200], "radius": 100, "icon": "・"},
     }
 
     TILESETS = {
@@ -84,43 +84,67 @@ class AppConfig:
 久米交差点,33.8143,132.7957,4,松山市久米"""
 
 # ==============================================================================
-# [UI/CSS] スマホ最適化スタイル
+# [UI/CSS] ライトテーマ＆スマホ最適化デザイン
 # ==============================================================================
 def inject_css():
     st.markdown("""
     <style>
-      :root{ --bg:#0b0f14; --card:#161b22; --text:#e6edf3; --accent:#2f81f7; }
+      /* カラーパレット定義 (ライトテーマ) */
+      :root{
+        --bg: #f4f7f9;       /* 全体の背景色：明るいグレー */
+        --card: #ffffff;     /* カードの背景色：白 */
+        --text: #333333;     /* メインテキスト色：濃いグレー */
+        --muted: #666666;    /* サブテキスト色：薄いグレー */
+        --accent: #0066cc;   /* アクセントカラー：青 */
+        --border: #e0e0e0;   /* ボーダー色 */
+      }
+      /* 全体の設定 */
       .stApp { background-color: var(--bg); color: var(--text); }
+      a { color: var(--accent) !important; text-decoration: none; }
       
-      /* タブのスタイル調整：指で押しやすく */
-      .stTabs [data-baseweb="tab-list"] { gap: 8px; margin-bottom: 10px; }
+      /* タブのスタイル調整：明るく、選択状態を明確に */
+      .stTabs [data-baseweb="tab-list"] { gap: 8px; margin-bottom: 12px; }
       .stTabs [data-baseweb="tab"] {
-        height: 45px; flex: 1; background-color: #21262d; border-radius: 8px; color: #8b949e; font-weight: bold;
+        height: 48px; flex: 1; background-color: #eaeff3; 
+        border-radius: 8px; color: var(--muted); font-weight: 600;
+        border: 1px solid transparent; transition: all 0.2s;
       }
+      .stTabs [data-baseweb="tab"]:hover { background-color: #e0e6ec; }
       .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        background-color: var(--accent); color: white;
+        background-color: var(--accent); color: white; border-color: var(--accent);
       }
 
-      /* ティッカー (無限ループ) */
+      /* ティッカー (無限ループ)：明るい背景で視認性アップ */
       .ticker-wrap {
-        width: 100%; overflow: hidden; background: #0d1117; border-bottom: 1px solid #30363d;
-        white-space: nowrap; padding: 8px 0; margin-bottom: 10px;
+        width: 100%; overflow: hidden; background: var(--card);
+        border-bottom: 1px solid var(--border); border-top: 1px solid var(--border);
+        white-space: nowrap; padding: 10px 0; margin-bottom: 12px;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.03);
       }
-      .ticker { display: inline-block; animation: ticker 40s linear infinite; }
+      .ticker { display: inline-block; animation: ticker 45s linear infinite; }
       @keyframes ticker { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
-      .ticker-item { margin-right: 40px; color: #e6edf3; font-size: 0.9rem; }
-      .ticker-tag { background: #30363d; padding: 2px 6px; border-radius: 4px; font-size: 0.75rem; margin-right: 5px; }
+      .ticker-item { margin-right: 40px; color: var(--text); font-size: 0.9rem; display: inline-flex; align-items: center; }
+      .ticker-tag { background: #eaeff3; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; margin-right: 6px; color: var(--muted); font-weight: bold;}
 
-      /* カードスタイル */
+      /* カードスタイル：白背景＋影で情報を整理 */
       .feed-card {
-        background: var(--card); padding: 14px; border-radius: 12px; border: 1px solid #30363d; margin-bottom: 10px;
+        background: var(--card); padding: 16px; border-radius: 12px;
+        border: 1px solid var(--border); margin-bottom: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.05); transition: transform 0.2s;
       }
-      .feed-header { display: flex; justify-content: space-between; margin-bottom: 6px; }
-      .feed-title { font-weight: bold; color: var(--text); display:flex; align-items:center; gap:6px;}
-      .feed-loc { font-size: 0.8rem; background: #21262d; padding: 2px 8px; border-radius: 10px; color: #8b949e; }
-      .feed-body { font-size: 0.9rem; line-height: 1.5; color: #d0d7de; }
-      .feed-link { text-align: right; font-size: 0.8rem; margin-top: 4px; }
-      .feed-link a { color: var(--accent); text-decoration: none; }
+      .feed-card:active { transform: scale(0.99); } /* タップ時のフィードバック */
+      .feed-header { display: flex; justify-content: space-between; margin-bottom: 8px; align-items: center;}
+      .feed-title { font-weight: 700; color: var(--text); display:flex; align-items:center; gap:8px; font-size: 1rem;}
+      .feed-loc { font-size: 0.8rem; background: #eaeff3; padding: 4px 10px; border-radius: 12px; color: var(--muted); font-weight: 600;}
+      .feed-body { font-size: 0.95rem; line-height: 1.6; color: #444; }
+      .feed-link { text-align: right; font-size: 0.85rem; margin-top: 8px; font-weight: 600;}
+      
+      /* 地図のツールチップもライトテーマに */
+      .map-tooltip {
+          background: white !important; color: #333 !important;
+          box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;
+          border: 1px solid #eee !important;
+      }
     </style>
     """, unsafe_allow_html=True)
 
@@ -133,7 +157,6 @@ def _meters_scale(lat: float) -> Tuple[float, float]:
     return 111320 * math.cos(math.radians(lat)), 110540
 
 def _project_point(p: List[float], a: List[float], b: List[float]) -> Tuple[List[float], float]:
-    # 点pを線分abに投影
     ax, ay = a; bx, by = b; px, py = p
     kx, ky = _meters_scale((ay+by)/2)
     ax2, ay2, bx2, by2, px2, py2 = ax*kx, ay*ky, bx*kx, by*ky, px*kx, py*ky
@@ -146,24 +169,16 @@ def _project_point(p: List[float], a: List[float], b: List[float]) -> Tuple[List
     return [projx2/kx, projy2/ky], dist
 
 def build_snap_lines(jpoints: List[Dict], ways: List[Dict]) -> List[Dict]:
-    """JARTICの点をOSM道路にスナップして線を作成"""
     lines = []
     if not jpoints or not ways: return lines
-    
     for jp in jpoints:
         total = jp.get("total", 0)
-        if total < 50: continue # 交通量が少ないものは線を表示しない
-        
+        if total < 50: continue
         p = jp["position"]
-        # 長さ（交通量に応じて0〜3km程度）
         length_m = min(3000, total * 5)
-        
-        # 最も近い道路を探す (簡易版: 総当たりは重いので最初のヒットを使う等の工夫が必要だが、ここでは全探索)
-        best_dist = 300 # 300m以内
+        best_dist = 300
         best_proj = None
         best_way_vec = None
-
-        # ※モバイル版のため、計算量を抑えるため上位の道路のみ対象とする等の最適化済みのwaysを使う
         for w in ways:
             coords = w["coords"]
             for i in range(len(coords)-1):
@@ -171,18 +186,15 @@ def build_snap_lines(jpoints: List[Dict], ways: List[Dict]) -> List[Dict]:
                 if dist < best_dist:
                     best_dist = dist
                     best_proj = proj
-                    # 道路の方向ベクトル
                     best_way_vec = [coords[i+1][0]-coords[i][0], coords[i+1][1]-coords[i][1]]
-
         if best_proj and best_way_vec:
-            # 道路に沿った線を生成（擬似的に直線を引く）
             vec_len = math.hypot(best_way_vec[0], best_way_vec[1])
             if vec_len > 0:
                 dx = (best_way_vec[0] / vec_len) * (length_m / 111000)
                 dy = (best_way_vec[1] / vec_len) * (length_m / 111000)
                 lines.append({
                     "path": [best_proj, [best_proj[0]+dx, best_proj[1]+dy]],
-                    "color": [255, 50, 50, 200], # 赤
+                    "color": [255, 50, 50, 200],
                     "width": 5 + min(15, total // 50)
                 })
     return lines
@@ -200,60 +212,37 @@ class Incident:
     src: str
 
 def fetch_police_data() -> List[Incident]:
-    """県警速報取得"""
     try:
         r = requests.get(AppConfig.POLICE_URL, headers={"User-Agent": AppConfig.USER_AGENT}, timeout=AppConfig.TIMEOUT)
         r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, "html.parser")
         text = soup.get_text("\n", strip=True)
         text = re.sub(r"【愛媛県警からのお願い！】[\s\S]*?(?=■|$)", "", text)
-        
         results = []
-        curr_head = ""
-        curr_body = []
-        
+        curr_head = ""; curr_body = []
         for line in text.split("\n"):
             if line.startswith("■"):
-                if curr_head:
-                    results.append(parse_incident(curr_head, " ".join(curr_body)))
-                curr_head = line.replace("■", "").strip()
-                curr_body = []
-            elif curr_head:
-                curr_body.append(line.strip())
+                if curr_head: results.append(parse_incident(curr_head, " ".join(curr_body)))
+                curr_head = line.replace("■", "").strip(); curr_body = []
+            elif curr_head: curr_body.append(line.strip())
         if curr_head: results.append(parse_incident(curr_head, " ".join(curr_body)))
         return results
-    except:
-        return []
+    except: return []
 
 def parse_incident(head: str, body: str) -> Incident:
     full = head + " " + body
     cat = next((k for k in AppConfig.CAT_STYLE if k in full), "その他")
     muni = next((k for k in AppConfig.CITY_DATA if k in full), "愛媛県")
     lon, lat = AppConfig.CITY_DATA.get(muni, (AppConfig.EHIME_LON, AppConfig.EHIME_LAT))
-    # 重なり防止の散らし
-    lon += random.uniform(-0.015, 0.015)
-    lat += random.uniform(-0.015, 0.015)
-    
-    return Incident(
-        category=cat, summary=body[:80]+"..." if len(body)>80 else body,
-        municipality=muni, lon=lon, lat=lat,
-        style=AppConfig.CAT_STYLE.get(cat, AppConfig.CAT_STYLE["その他"]),
-        src=AppConfig.POLICE_URL
-    )
+    lon += random.uniform(-0.015, 0.015); lat += random.uniform(-0.015, 0.015)
+    return Incident(cat, body[:80]+"..." if len(body)>80 else body, muni, lon, lat, AppConfig.CAT_STYLE.get(cat, AppConfig.CAT_STYLE["その他"]), AppConfig.POLICE_URL)
 
 def fetch_jartic_data() -> List[Dict]:
-    """JARTIC交通量(5分値)取得"""
     now = datetime.utcnow() + timedelta(hours=9) - timedelta(minutes=20)
     mm = (now.minute // 5) * 5
     tcode = now.replace(minute=mm, second=0).strftime("%Y%m%d%H%M")
-    
-    # 愛媛周辺BBOX
     cql = f"道路種別=3 AND 時間コード={tcode} AND BBOX(ジオメトリ,132.2,33.0,133.7,34.2,'EPSG:4326')"
-    params = {
-        "service":"WFS", "version":"2.0.0", "request":"GetFeature",
-        "typeNames":"t_travospublic_measure_5m", "outputFormat":"application/json",
-        "cql_filter": cql
-    }
+    params = {"service":"WFS", "version":"2.0.0", "request":"GetFeature", "typeNames":"t_travospublic_measure_5m", "outputFormat":"application/json", "cql_filter": cql}
     try:
         r = requests.get(AppConfig.JARTIC_URL, params=params, timeout=AppConfig.TIMEOUT)
         if r.status_code!=200: return []
@@ -264,26 +253,17 @@ def fetch_jartic_data() -> List[Dict]:
             total = (props.get("上り・小型交通量") or 0) + (props.get("下り・小型交通量") or 0)
             coords = f.get("geometry", {}).get("coordinates", [])
             if coords and total > 0:
-                for c in coords:
-                    points.append({"position": [c[0], c[1]], "total": int(total)})
+                for c in coords: points.append({"position": [c[0], c[1]], "total": int(total)})
         return points
-    except:
-        return []
+    except: return []
 
 def fetch_osm_simple() -> List[Dict]:
-    """JARTIC線スナップ用の主要道路データ取得"""
-    # モバイル版のため、軽量化して取得（データ量を絞る）
     q = f"""[out:json][timeout:10];way["highway"~"primary|trunk"](33.0,132.2,34.2,133.7);out geom;"""
     try:
         r = requests.post(AppConfig.OVERPASS_URL, data={"data": q}, timeout=5)
         if r.status_code==200:
-            ways = []
-            for el in r.json().get("elements", []):
-                if "geometry" in el:
-                    ways.append({"coords": [[p["lon"], p["lat"]] for p in el["geometry"]]})
-            return ways
-    except:
-        return []
+            return [{"coords": [[p["lon"], p["lat"]] for p in el["geometry"]]} for el in r.json().get("elements", []) if "geometry" in el]
+    except: return []
     return []
 
 # ==============================================================================
@@ -291,90 +271,67 @@ def fetch_osm_simple() -> List[Dict]:
 # ==============================================================================
 
 def main():
+    # ページ設定：広がりを持たせる
     st.set_page_config(page_title="ESP Mobile", layout="wide", page_icon="🚓")
     inject_css()
 
     # --- Sidebar (設定) ---
     with st.sidebar:
-        st.header("⚙️ 設定")
-        area_filter = st.multiselect("地域フィルタ", list(AppConfig.CITY_DATA.keys()))
-        map_style_name = st.selectbox("地図スタイル", list(AppConfig.TILESETS.keys()))
-        is_3d = st.toggle("3D表示 (交差点/建物)", value=True)
+        st.header("⚙️ 表示設定")
+        area_filter = st.multiselect("地域で絞り込み", list(AppConfig.CITY_DATA.keys()))
+        st.markdown("---")
+        map_style_name = st.selectbox("地図の背景", list(AppConfig.TILESETS.keys()))
+        is_3d = st.toggle("3Dモード (交差点)", value=True)
         show_jartic = st.toggle("交通情報 (JARTIC)", value=True)
-        show_hotspots = st.toggle("危険交差点", value=True)
-    
-    # --- Data Loading (Parallel) ---
-    with st.spinner("データ更新中..."):
+        show_hotspots = st.toggle("危険交差点表示", value=True)
+        st.caption("※3Dモードは地図を傾けると有効になります")
+
+    # --- Data Loading ---
+    with st.spinner("最新データを取得中..."):
         with ThreadPoolExecutor(max_workers=AppConfig.MAX_WORKERS) as exe:
             f1 = exe.submit(fetch_police_data)
             f2 = exe.submit(fetch_jartic_data)
             f3 = exe.submit(fetch_osm_simple)
-            
             incidents = f1.result()
             jartic_pts = f2.result() if show_jartic else []
             osm_ways = f3.result() if show_jartic else []
 
-    # フィルタ適用
-    if area_filter:
-        incidents = [i for i in incidents if i.municipality in area_filter]
+    if area_filter: incidents = [i for i in incidents if i.municipality in area_filter]
 
     # --- Ticker ---
     ticker_text = ""
-    for i in incidents[:5]:
-        ticker_text += f"<span class='ticker-item'><span class='ticker-tag'>{i.category}</span>{i.municipality}: {i.summary[:20]}</span>"
+    for i in incidents[:7]:
+        ticker_text += f"<span class='ticker-item'><span class='ticker-tag'>{i.category}</span>{i.municipality}｜{i.summary[:25]}</span>"
     if show_jartic:
-        ticker_text += "<span class='ticker-item' style='color:#ffa500'>【交通】JARTIC情報 連携中</span>"
-    
+        ticker_text += "<span class='ticker-item' style='color:var(--accent); font-weight:bold;'>【交通】JARTICリアルタイム情報 連携中</span>"
     st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{ticker_text}</div></div>", unsafe_allow_html=True)
 
     # --- Main Tabs ---
-    tab_map, tab_list = st.tabs(["🗺️ マップ", "🚨 リスト"])
+    tab_map, tab_list = st.tabs(["🗺️ マップで見る", "🚨 リストで見る"])
 
     # === TAB 1: MAP ===
     with tab_map:
         layers = []
-        
-        # 1. 背景地図 (TileLayer) - APIキー不要で表示するための重要修正
+        # 1. 背景地図 (TileLayer)
         tile_cfg = AppConfig.TILESETS[map_style_name]
-        layers.append(pdk.Layer(
-            "TileLayer", data=tile_cfg["url"],
-            min_zoom=0, max_zoom=tile_cfg["max_zoom"], opacity=1.0
-        ))
+        layers.append(pdk.Layer("TileLayer", data=tile_cfg["url"], min_zoom=0, max_zoom=tile_cfg["max_zoom"], opacity=1.0))
 
         # 2. 危険交差点 (Hotspots)
         if show_hotspots:
             hot_df = pd.read_csv(StringIO(AppConfig.HOTSPOT_CSV))
             hot_df["val"] = hot_df["年間最多事故件数"].astype(int)
             if is_3d:
-                layers.append(pdk.Layer(
-                    "ColumnLayer", data=hot_df,
-                    get_position="[経度, 緯度]", get_elevation="val", elevation_scale=50,
-                    radius=100, get_fill_color=[255, 0, 0, 150], extruded=True, pickable=True
-                ))
+                layers.append(pdk.Layer("ColumnLayer", data=hot_df, get_position="[経度, 緯度]", get_elevation="val", elevation_scale=50, radius=100, get_fill_color=[255, 0, 0, 180], extruded=True, pickable=True))
             else:
-                layers.append(pdk.Layer(
-                    "HeatmapLayer", data=hot_df,
-                    get_position="[経度, 緯度]", get_weight="val",
-                    radius_pixels=60, intensity=2, threshold=0.1
-                ))
+                layers.append(pdk.Layer("HeatmapLayer", data=hot_df, get_position="[経度, 緯度]", get_weight="val", radius_pixels=60, intensity=2, threshold=0.1))
 
         # 3. JARTIC (Traffic)
         if show_jartic and jartic_pts:
-            # 点 (Scatter)
-            layers.append(pdk.Layer(
-                "ScatterplotLayer", data=jartic_pts,
-                get_position="position", get_fill_color=[255, 200, 0, 180], get_radius="total",
-                radius_scale=0.5, radius_min_pixels=3, pickable=True
-            ))
-            # 線 (Lines - Snapped)
+            layers.append(pdk.Layer("ScatterplotLayer", data=jartic_pts, get_position="position", get_fill_color=[255, 200, 0, 180], get_radius="total", radius_scale=0.5, radius_min_pixels=3, pickable=True))
             if osm_ways:
                 snap_lines = build_snap_lines(jartic_pts, osm_ways)
                 if snap_lines:
-                    layers.append(pdk.Layer(
-                        "PathLayer", data=snap_lines,
-                        get_path="path", get_color="color", get_width="width",
-                        width_min_pixels=2, opacity=0.8
-                    ))
+                    layers.append(pdk.Layer("PathLayer", data=snap_lines, get_path="path", get_color="color", get_width="width", width_min_pixels=2, opacity=0.8))
 
         # 4. 事件・事故 (Incidents)
         if incidents:
@@ -382,59 +339,42 @@ def main():
             df_inc["color"] = df_inc["style"].apply(lambda s: s["color"])
             df_inc["radius"] = df_inc["style"].apply(lambda s: s["radius"])
             df_inc["icon"] = df_inc["style"].apply(lambda s: s["icon"])
-            
-            # HTML for Tooltip (Bug fix: prevent code block)
+            # Tooltip: ライトテーマ用にスタイル調整
             df_inc["tooltip"] = df_inc.apply(lambda r: f"""
-                <div style='background:#1f2937;color:white;padding:8px;border-radius:4px;font-size:12px;'>
-                <b>{r['icon']} {r['category']}</b><br>{r['municipality']}<br>{r['summary'][:30]}
+                <div style='font-family:sans-serif; padding:4px;'>
+                <div style='font-weight:bold; font-size:1.1em; margin-bottom:4px;'>{r['icon']} {r['category']}</div>
+                <div style='color:#666; font-size:0.9em; margin-bottom:6px;'>{r['municipality']}</div>
+                <div style='line-height:1.4;'>{r['summary'][:40]}</div>
                 </div>""".replace("\n", ""), axis=1)
 
-            layers.append(pdk.Layer(
-                "ScatterplotLayer", data=df_inc,
-                get_position="[lon, lat]", get_fill_color="color", get_radius="radius",
-                stroked=True, get_line_color=[255,255,255], line_width_min_pixels=1,
-                pickable=True
-            ))
+            layers.append(pdk.Layer("ScatterplotLayer", data=df_inc, get_position="[lon, lat]", get_fill_color="color", get_radius="radius", stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2, pickable=True))
 
-        # Deck描画
-        view_state = pdk.ViewState(
-            latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON,
-            zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0
-        )
-        
-        # map_provider=Noneを指定し、TileLayerを表示させる
-        st.pydeck_chart(pdk.Deck(
-            layers=layers, initial_view_state=view_state,
-            tooltip={"html": "{tooltip}"}, map_provider=None
-        ), use_container_width=True, height=500) # スマホで操作しやすい高さ
+        view_state = pdk.ViewState(latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON, zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0)
+        # map_provider=Noneで背景地図を確実に表示
+        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"html": "{tooltip}", "style": {"color": "#333", "backgroundColor": "white"}}, map_provider=None), use_container_width=True, height=500)
 
     # === TAB 2: LIST ===
     with tab_list:
-        q = st.text_input("🔍 キーワード検索", placeholder="場所や内容で検索...")
-        view_list = incidents
-        if q:
-            view_list = [i for i in incidents if q in (i.summary + i.municipality)]
+        st.markdown("<div style='margin-bottom:10px;'></div>", unsafe_allow_html=True) # スペーサー
+        q = st.text_input("Search", placeholder="🔍 キーワード検索 (例: 事故, 松山市...)")
+        view_list = [i for i in incidents if q in (i.summary + i.municipality)] if q else incidents
         
         html_buffer = ""
         for item in view_list:
-            icon = item.style['icon']
-            # textwrap.dedentでインデントを除去し、HTMLタグとして正しく認識させる
             card = textwrap.dedent(f"""
                 <div class='feed-card'>
                     <div class='feed-header'>
-                        <div class='feed-title'><span>{icon}</span>{item.category}</div>
+                        <div class='feed-title'><span>{item.style['icon']}</span>{item.category}</div>
                         <div class='feed-loc'>{item.municipality}</div>
                     </div>
                     <div class='feed-body'>{item.summary}</div>
-                    <div class='feed-link'><a href='{item.src}' target='_blank'>詳細 &rarr;</a></div>
+                    <div class='feed-link'><a href='{item.src}' target='_blank'>詳細を確認 &rarr;</a></div>
                 </div>
             """)
             html_buffer += card
         
-        if not view_list:
-            st.info("該当する情報はありません")
-        else:
-            st.markdown(html_buffer, unsafe_allow_html=True)
+        if not view_list: st.info("該当する情報はありませんでした。")
+        else: st.markdown(html_buffer, unsafe_allow_html=True)
 
     st_autorefresh(interval=5 * 60 * 1000, key="refresh")
 
