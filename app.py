@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-愛媛セーフティ・プラットフォーム (ESP) - Debugged & Stable Edition
-Version: 17.0
+愛媛セーフティ・プラットフォーム (ESP) - Vertical Layout Edition
+Version: 18.0
 Author: World Class Program Designer
-Description: データ取得失敗時の自動フォールバック機能搭載、キャッシュ強化、UI安定化版
+Description: 地図とニュースリストを縦に配置した一覧性重視のレイアウト
 """
 
 import math
@@ -34,9 +34,9 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 class AppConfig:
     TITLE = "愛媛セーフティ・プラットフォーム"
-    SUBTITLE = "Criminal Coefficient Visualizer v17.0 (Stable)"
-    USER_AGENT = "ESP/17.0-Stable"
-    TIMEOUT = 8 # タイムアウトを短めに設定してレスポンス向上
+    SUBTITLE = "Safety Dashboard v18.0"
+    USER_AGENT = "ESP/18.0-Vertical"
+    TIMEOUT = 8
     MAX_WORKERS = 4
     
     # 愛媛県中心座標
@@ -98,10 +98,12 @@ def inject_css():
       .stApp { background-color: var(--bg); color: var(--text); font-family: 'Helvetica Neue', Arial, sans-serif; }
       a { color: var(--accent) !important; text-decoration: none; }
       
-      /* タブ */
-      .stTabs [data-baseweb="tab-list"] { gap: 8px; margin-bottom: 16px; }
-      .stTabs [data-baseweb="tab"] { height: 50px; flex: 1; background-color: #dfe6e9; border-radius: 8px; color: var(--muted); font-weight: 700; border: none; }
-      .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: var(--accent); color: white; box-shadow: 0 4px 6px rgba(9, 132, 227, 0.3); }
+      /* セクションヘッダー */
+      .section-header {
+        font-size: 1.2rem; font-weight: 800; color: var(--text); margin: 24px 0 12px 0;
+        display: flex; align-items: center; gap: 8px;
+        border-left: 5px solid var(--accent); padding-left: 10px;
+      }
 
       /* カード */
       .feed-card {
@@ -115,49 +117,26 @@ def inject_css():
       .feed-loc { font-size: 0.75rem; background: #f1f2f6; padding: 4px 10px; border-radius: 20px; color: #636e72; font-weight: 600; letter-spacing: 0.5px;}
       .feed-body { font-size: 0.95rem; line-height: 1.6; color: #636e72; margin-bottom: 12px; }
 
-      /* --- スタイリッシュ犯罪係数パネル --- */
+      /* 犯罪係数パネル */
       .coef-panel {
         background: #f8f9fa; padding: 12px 16px; border-top: 1px solid var(--border);
         display: flex; flex-direction: column; gap: 8px;
       }
-      .coef-row-main {
-        display: flex; justify-content: space-between; align-items: flex-end;
-      }
-      .coef-label {
-        font-size: 0.7rem; font-weight: 700; color: #b2bec3; letter-spacing: 1px; margin-bottom: 2px;
-      }
-      .coef-val-box {
-        text-align: right; line-height: 1;
-      }
-      .coef-val {
-        font-family: 'Courier New', monospace; font-weight: 900; font-size: 2.2rem;
-        letter-spacing: -1px; text-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      }
-      .coef-level {
-        font-size: 0.7rem; font-weight: 800; text-transform: uppercase; color: #b2bec3;
-      }
+      .coef-row-main { display: flex; justify-content: space-between; align-items: flex-end; }
+      .coef-label { font-size: 0.7rem; font-weight: 700; color: #b2bec3; letter-spacing: 1px; margin-bottom: 2px; }
+      .coef-val-box { text-align: right; line-height: 1; }
+      .coef-val { font-family: 'Courier New', monospace; font-weight: 900; font-size: 2.2rem; letter-spacing: -1px; text-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+      .coef-level { font-size: 0.7rem; font-weight: 800; text-transform: uppercase; color: #b2bec3; }
 
-      /* メーターバー */
-      .meter-track {
-        width: 100%; height: 6px; background: #dfe6e9; border-radius: 3px; overflow: hidden; margin-top: 4px;
-      }
-      .meter-fill {
-        height: 100%; border-radius: 3px; transition: width 0.5s ease-out;
-      }
-
-      /* 詳細グリッド */
-      .coef-grid {
-        display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px;
-      }
-      .coef-item {
-        background: #fff; padding: 6px 10px; border-radius: 6px; border: 1px solid #eee;
-        font-size: 0.8rem; display: flex; align-items: center; gap: 6px; color: #636e72; font-weight: 500;
-      }
+      .meter-track { width: 100%; height: 6px; background: #dfe6e9; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+      .meter-fill { height: 100%; border-radius: 3px; transition: width 0.5s ease-out; }
+      
+      .coef-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px; }
+      .coef-item { background: #fff; padding: 6px 10px; border-radius: 6px; border: 1px solid #eee; font-size: 0.8rem; display: flex; align-items: center; gap: 6px; color: #636e72; font-weight: 500; }
       .coef-icon { font-size: 1rem; }
 
       .feed-link { text-align: right; padding: 8px 16px; background: #fff; border-top: 1px solid #f1f2f6;}
-      .feed-link a { font-size: 0.85rem; font-weight: 700; color: var(--accent); }
-
+      
       /* ティッカー */
       .ticker-wrap { background: #fff; border-bottom: 1px solid var(--border); border-top: 1px solid var(--border); padding: 8px 0; white-space: nowrap; overflow: hidden; margin-bottom: 10px;}
       .ticker { display: inline-block; animation: ticker 50s linear infinite; }
@@ -172,54 +151,38 @@ def inject_css():
 # [Logic] 環境犯罪係数・予測ロジック
 # ==============================================================================
 class EnvironmentalAnalyzer:
-    """気象・天文データに基づく環境分析"""
-    
     @staticmethod
     def get_moon_phase(date: datetime) -> Dict:
-        """月齢計算"""
         diff = date - datetime(2000, 1, 6)
         days = diff.days
         lunation = 29.53058867
         moon_age = days % lunation
-        
         phase_name = "通常月"
         risk_factor = 1.0
-        
         if moon_age < 1.0 or moon_age > 28.5:
-            phase_name = "新月🌑"
-            risk_factor = 1.15
+            phase_name = "新月🌑"; risk_factor = 1.15
         elif 13.8 < moon_age < 15.8:
-            phase_name = "満月🌕"
-            risk_factor = 1.25
-            
+            phase_name = "満月🌕"; risk_factor = 1.25
         return {"age": moon_age, "name": phase_name, "factor": risk_factor}
 
     @staticmethod
     def estimate_weather(lat: float, lon: float, dt: datetime) -> Dict:
-        """愛媛県気象シミュレーション"""
-        month = dt.month
-        hour = dt.hour
+        month = dt.month; hour = dt.hour
         base_temps = {1:6, 2:7, 3:10, 4:15, 5:20, 6:24, 7:28, 8:30, 9:26, 10:20, 11:14, 12:9}
         hour_offset = -math.cos(math.pi * (hour - 4) / 12) * 4
-        # Seed random to keep stable per reload if needed, but here we want some life
         temp = base_temps[month] + hour_offset + random.uniform(-2, 2)
         humidity = 60 + (20 if month in [6,7,8,9] else -10) + random.uniform(-5, 5)
         di = 0.81 * temp + 0.01 * humidity * (0.99 * temp - 14.3) + 46.3
-        
         stress_factor = 1.0
         if di > 75: stress_factor = 1.1
         if di > 80: stress_factor = 1.3
-        
         return {"temp": round(temp, 1), "humidity": round(humidity, 1), "di": round(di, 1), "factor": stress_factor}
 
 def calculate_crime_coefficient(category: str, dt: datetime) -> Dict:
-    """犯罪係数算出"""
     base = AppConfig.CAT_STYLE.get(category, AppConfig.CAT_STYLE["その他"])["base_risk"]
     moon = EnvironmentalAnalyzer.get_moon_phase(dt)
     weather = EnvironmentalAnalyzer.estimate_weather(33.8, 132.7, dt)
-    
-    time_factor = 1.0
-    if 23 <= dt.hour or dt.hour <= 4: time_factor = 1.3
+    time_factor = 1.3 if (23 <= dt.hour or dt.hour <= 4) else 1.0
     
     coef = base * moon["factor"] * weather["factor"] * time_factor
     coef = min(99.9, max(10.0, coef))
@@ -230,26 +193,18 @@ def calculate_crime_coefficient(category: str, dt: datetime) -> Dict:
     if time_factor > 1.1: reasons.append("深夜帯")
     if not reasons: reasons.append("平常")
     
-    color = "#2ecc71" # Safe (Green)
+    color = "#2ecc71" # Normal
     level = "Normal"
-    if coef > 60: 
-        color = "#f39c12" # Caution (Orange)
-        level = "Caution"
-    if coef > 80: 
-        color = "#e74c3c" # Danger (Red)
-        level = "Critical"
+    if coef > 60: color = "#f39c12"; level = "Caution"
+    if coef > 80: color = "#e74c3c"; level = "Critical"
     
     return {
-        "score": int(coef),
-        "color": color,
-        "level": level,
-        "reasons": "・".join(reasons),
-        "weather_text": f"{weather['temp']}℃ (不快指数{int(weather['di'])})",
-        "moon_text": moon["name"]
+        "score": int(coef), "color": color, "level": level, "reasons": "・".join(reasons),
+        "weather_text": f"{weather['temp']}℃ (不快指数{int(weather['di'])})", "moon_text": moon["name"]
     }
 
 # ==============================================================================
-# [Geometry] 渋滞線生成ロジック
+# [Geometry] 渋滞線生成
 # ==============================================================================
 def _meters_scale(lat: float) -> Tuple[float, float]:
     return 111320 * math.cos(math.radians(lat)), 110540
@@ -290,7 +245,7 @@ def build_snap_lines(jpoints: List[Dict], ways: List[Dict]) -> List[Dict]:
     return lines
 
 # ==============================================================================
-# [Data Fetching with Fallback]
+# [Data Fetching]
 # ==============================================================================
 @dataclass
 class Incident:
@@ -298,8 +253,6 @@ class Incident:
     style: Dict; src: str; coef: Dict
 
 def generate_mock_incidents() -> List[Incident]:
-    """【重要】データ取得失敗時のデモデータ生成"""
-    logger.warning("Using Mock Data")
     mock_data = [
         ("交通事故", "松山市国道11号線付近で車両同士の追突事故が発生。", "松山市"),
         ("不審者", "新居浜市内で声かけ事案が発生。注意を呼びかけ。", "新居浜市"),
@@ -310,9 +263,7 @@ def generate_mock_incidents() -> List[Incident]:
     results = []
     for cat, body, muni in mock_data:
         lon, lat = AppConfig.CITY_DATA.get(muni, (AppConfig.EHIME_LON, AppConfig.EHIME_LAT))
-        # 座標を少し散らす
-        lon += random.uniform(-0.02, 0.02)
-        lat += random.uniform(-0.02, 0.02)
+        lon += random.uniform(-0.02, 0.02); lat += random.uniform(-0.02, 0.02)
         coef_data = calculate_crime_coefficient(cat, datetime.now())
         results.append(Incident(cat, body, muni, lon, lat, 
                        AppConfig.CAT_STYLE.get(cat, AppConfig.CAT_STYLE["その他"]), 
@@ -321,17 +272,13 @@ def generate_mock_incidents() -> List[Incident]:
 
 @st.cache_data(ttl=600)
 def fetch_police_data(days: int = 7) -> List[Incident]:
-    """警察データ取得 (失敗時はデモデータを返す)"""
     try:
         r = requests.get(AppConfig.POLICE_URL, headers={"User-Agent": AppConfig.USER_AGENT}, timeout=AppConfig.TIMEOUT)
-        if r.status_code != 200:
-            return generate_mock_incidents()
-            
+        if r.status_code != 200: return generate_mock_incidents()
         r.encoding = r.apparent_encoding or 'utf-8'
         soup = BeautifulSoup(r.text, "html.parser")
         text = soup.get_text("\n", strip=True)
         text = re.sub(r"【愛媛県警からのお願い！】[\s\S]*?(?=■|$)", "", text)
-        
         results = []; curr_head = ""; curr_body = []
         for line in text.split("\n"):
             if line.startswith("■"):
@@ -339,13 +286,10 @@ def fetch_police_data(days: int = 7) -> List[Incident]:
                 curr_head = line.replace("■", "").strip(); curr_body = []
             elif curr_head: curr_body.append(line.strip())
         if curr_head: results.append(parse_incident(curr_head, " ".join(curr_body)))
-        
-        if not results: # パースできた結果が0件の場合もデモデータを返す
-            return generate_mock_incidents()
-            
+        if not results: return generate_mock_incidents()
         return results
     except Exception as e:
-        logger.error(f"Police Fetch Error: {e}")
+        logger.error(f"Police Error: {e}")
         return generate_mock_incidents()
 
 def parse_incident(head: str, body: str) -> Incident:
@@ -377,9 +321,7 @@ def fetch_jartic_data() -> List[Dict]:
             if coords and total > 0:
                 for c in coords: points.append({"position": [c[0], c[1]], "total": int(total)})
         return points
-    except Exception as e:
-        logger.error(f"JARTIC Fetch Error: {e}")
-        return []
+    except Exception: return []
 
 @st.cache_data(ttl=3600)
 def fetch_osm_simple() -> List[Dict]:
@@ -388,9 +330,7 @@ def fetch_osm_simple() -> List[Dict]:
         r = requests.post(AppConfig.OVERPASS_URL, data={"data": q}, timeout=15)
         if r.status_code==200:
             return [{"coords": [[p["lon"], p["lat"]] for p in el["geometry"]]} for el in r.json().get("elements", []) if "geometry" in el]
-    except Exception as e:
-        logger.error(f"OSM Fetch Error: {e}")
-        return []
+    except Exception: return []
     return []
 
 # ==============================================================================
@@ -402,18 +342,13 @@ def main():
 
     with st.sidebar:
         st.header("⚙️ 設定")
-        env = EnvironmentalAnalyzer.estimate_weather(33.8, 132.7, datetime.now())
-        moon = EnvironmentalAnalyzer.get_moon_phase(datetime.now())
-        st.caption(f"ENV: {env['temp']}℃ / {moon['name']}")
-        
-        area_filter = st.multiselect("地域フィルタ", list(AppConfig.CITY_DATA.keys()))
-        map_style = st.selectbox("地図スタイル", list(AppConfig.TILESETS.keys()))
+        area_filter = st.multiselect("地域", list(AppConfig.CITY_DATA.keys()))
+        map_style = st.selectbox("地図", list(AppConfig.TILESETS.keys()))
         is_3d = st.toggle("3Dモード", value=True)
         show_jartic = st.toggle("交通情報", value=True)
         show_hotspots = st.toggle("危険交差点", value=True)
 
-    # データを取得（失敗してもキャッシュorデモデータが返るため安全）
-    with st.spinner("Analyzing data..."):
+    with st.spinner("Loading..."):
         with ThreadPoolExecutor(max_workers=AppConfig.MAX_WORKERS) as exe:
             f1 = exe.submit(fetch_police_data)
             f2 = exe.submit(fetch_jartic_data)
@@ -428,89 +363,89 @@ def main():
     ticker_html = ""
     for i in incidents[:5]:
         ticker_html += f"<span class='ticker-item'><b>{i.category}</b> {i.municipality} ({i.coef['score']})</span>"
-    if show_jartic: ticker_html += "<span class='ticker-item' style='color:#0984e3'><b>JARTIC</b> リアルタイム交通情報</span>"
+    if show_jartic: ticker_html += "<span class='ticker-item' style='color:#0984e3'><b>JARTIC</b> 交通情報連携中</span>"
     st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{ticker_html}</div></div>", unsafe_allow_html=True)
 
-    tab_map, tab_list = st.tabs(["🗺️ マップ", "🚨 解析リスト"])
+    # === MAP SECTION ===
+    st.markdown("<div class='section-header'>🗺️ リアルタイム・セーフティマップ</div>", unsafe_allow_html=True)
+    
+    layers = []
+    tile = AppConfig.TILESETS[map_style]
+    layers.append(pdk.Layer("TileLayer", data=tile["url"], min_zoom=0, max_zoom=tile["max_zoom"], opacity=1.0))
 
-    with tab_map:
-        layers = []
-        tile = AppConfig.TILESETS[map_style]
-        layers.append(pdk.Layer("TileLayer", data=tile["url"], min_zoom=0, max_zoom=tile["max_zoom"], opacity=1.0))
+    if show_jartic and jartic_pts and osm_ways:
+        snap_lines = build_snap_lines(jartic_pts, osm_ways)
+        if snap_lines:
+            layers.append(pdk.Layer("PathLayer", data=snap_lines, get_path="path", get_color="color", get_width="width", width_min_pixels=3, opacity=0.8))
+    if show_jartic and jartic_pts:
+        layers.append(pdk.Layer("ScatterplotLayer", data=jartic_pts, get_position="position", get_fill_color=[255, 200, 0, 160], get_radius="total", radius_scale=0.5, radius_min_pixels=3, pickable=True))
+    if show_hotspots:
+        hot_df = pd.read_csv(StringIO(AppConfig.HOTSPOT_CSV))
+        hot_df["val"] = hot_df["年間最多事故件数"].astype(int)
+        layers.append(pdk.Layer("ColumnLayer" if is_3d else "HeatmapLayer", data=hot_df, get_position="[経度, 緯度]", get_elevation="val", elevation_scale=50, radius=100, get_fill_color=[255, 0, 0, 180], extruded=True, pickable=True))
 
-        if show_jartic and jartic_pts and osm_ways:
-            snap_lines = build_snap_lines(jartic_pts, osm_ways)
-            if snap_lines:
-                layers.append(pdk.Layer("PathLayer", data=snap_lines, get_path="path", get_color="color", get_width="width", width_min_pixels=3, opacity=0.8))
-        if show_jartic and jartic_pts:
-            layers.append(pdk.Layer("ScatterplotLayer", data=jartic_pts, get_position="position", get_fill_color=[255, 200, 0, 160], get_radius="total", radius_scale=0.5, radius_min_pixels=3, pickable=True))
-        if show_hotspots:
-            hot_df = pd.read_csv(StringIO(AppConfig.HOTSPOT_CSV))
-            hot_df["val"] = hot_df["年間最多事故件数"].astype(int)
-            layers.append(pdk.Layer("ColumnLayer" if is_3d else "HeatmapLayer", data=hot_df, get_position="[経度, 緯度]", get_elevation="val", elevation_scale=50, radius=100, get_fill_color=[255, 0, 0, 180], extruded=True, pickable=True))
+    if incidents:
+        df_inc = pd.DataFrame([asdict(i) for i in incidents])
+        df_inc["color"] = df_inc["style"].apply(lambda s: s["color"])
+        df_inc["radius"] = df_inc["style"].apply(lambda s: s["radius"])
+        df_inc["icon"] = df_inc["style"].apply(lambda s: s["icon"])
+        df_inc["tooltip"] = df_inc.apply(lambda r: f"""
+            <div style='font-family:sans-serif; padding:4px;'>
+            <div style='font-size:1.1em;font-weight:bold;margin-bottom:4px'>{r['icon']} {r['category']} <span style='font-size:0.8em;color:{r['coef']['color']}'>Lv.{r['coef']['score']}</span></div>
+            <div style='font-size:0.9em;color:#555'>{r['municipality']}</div>
+            <div style='margin-top:4px'>{r['summary'][:30]}</div>
+            </div>""".replace("\n", ""), axis=1)
+        layers.append(pdk.Layer("ScatterplotLayer", data=df_inc, get_position="[lon, lat]", get_fill_color="color", get_radius="radius", stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2, pickable=True))
 
-        if incidents:
-            df_inc = pd.DataFrame([asdict(i) for i in incidents])
-            df_inc["color"] = df_inc["style"].apply(lambda s: s["color"])
-            df_inc["radius"] = df_inc["style"].apply(lambda s: s["radius"])
-            df_inc["icon"] = df_inc["style"].apply(lambda s: s["icon"])
-            df_inc["tooltip"] = df_inc.apply(lambda r: f"""
-                <div style='font-family:sans-serif; padding:4px;'>
-                <div style='font-size:1.1em;font-weight:bold;margin-bottom:4px'>{r['icon']} {r['category']} <span style='font-size:0.8em;color:{r['coef']['color']}'>Lv.{r['coef']['score']}</span></div>
-                <div style='font-size:0.9em;color:#555'>{r['municipality']}</div>
-                <div style='margin-top:4px'>{r['summary'][:30]}</div>
-                </div>""".replace("\n", ""), axis=1)
-            layers.append(pdk.Layer("ScatterplotLayer", data=df_inc, get_position="[lon, lat]", get_fill_color="color", get_radius="radius", stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2, pickable=True))
+    view_state = pdk.ViewState(latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON, zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0)
+    st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"html": "{tooltip}", "style": {"color": "#333", "backgroundColor": "white"}}, map_provider=None, map_style=None), use_container_width=True, height=500)
 
-        view_state = pdk.ViewState(latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON, zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0)
-        # map_provider=Noneとmap_style=Noneを明示してTileLayerを確実に表示
-        st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"html": "{tooltip}", "style": {"color": "#333", "backgroundColor": "white"}}, map_provider=None, map_style=None), use_container_width=True, height=520)
-
-    with tab_list:
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        q = st.text_input("検索", placeholder="キーワード...")
-        view_list = [i for i in incidents if q in (i.summary + i.municipality)] if q else incidents
-        
-        html_buffer = ""
-        for item in view_list:
-            coef = item.coef
-            card = textwrap.dedent(f"""
-                <div class='feed-card'>
-                    <div class='feed-content'>
-                        <div class='feed-header'>
-                            <div class='feed-title'><span>{item.style['icon']}</span>{item.category}</div>
-                            <div class='feed-loc'>{item.municipality}</div>
-                        </div>
-                        <div class='feed-body'>{item.summary}</div>
+    # === LIST SECTION ===
+    st.markdown("<div class='section-header'>🚨 発生事案ニュース & 犯罪係数</div>", unsafe_allow_html=True)
+    
+    q = st.text_input("検索", placeholder="キーワード (例: 事故, 松山市...)")
+    view_list = [i for i in incidents if q in (i.summary + i.municipality)] if q else incidents
+    
+    html_buffer = ""
+    for item in view_list:
+        coef = item.coef
+        card = textwrap.dedent(f"""
+            <div class='feed-card'>
+                <div class='feed-content'>
+                    <div class='feed-header'>
+                        <div class='feed-title'><span>{item.style['icon']}</span>{item.category}</div>
+                        <div class='feed-loc'>{item.municipality}</div>
                     </div>
-                    
-                    <div class='coef-panel'>
-                        <div class='coef-label'>CRIME COEFFICIENT</div>
-                        <div class='coef-row-main'>
-                            <div style='width:100%; margin-right:12px;'>
-                                <div class='meter-track'>
-                                    <div class='meter-fill' style='width: {coef["score"]}%; background: {coef["color"]};'></div>
-                                </div>
-                                <div class='coef-grid'>
-                                    <div class='coef-item'><span class='coef-icon'>🌡️</span> {coef["weather_text"]}</div>
-                                    <div class='coef-item'><span class='coef-icon'>🌑</span> {coef["moon_text"]}</div>
-                                    <div class='coef-item'><span class='coef-icon'>⚠️</span> {coef["reasons"]}</div>
-                                </div>
-                            </div>
-                            <div class='coef-val-box'>
-                                <div class='coef-val' style='color: {coef["color"]}'>{coef["score"]}</div>
-                                <div class='coef-level'>{coef["level"]}</div>
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <div class='feed-link'><a href='{item.src}' target='_blank'>詳細を確認 &rarr;</a></div>
+                    <div class='feed-body'>{item.summary}</div>
                 </div>
-            """)
-            html_buffer += card
-        
-        if not view_list: st.info("情報はありません")
-        else: st.markdown(html_buffer, unsafe_allow_html=True)
+                
+                <div class='coef-panel'>
+                    <div class='coef-label'>CRIME COEFFICIENT</div>
+                    <div class='coef-row-main'>
+                        <div style='width:100%; margin-right:12px;'>
+                            <div class='meter-track'>
+                                <div class='meter-fill' style='width: {coef["score"]}%; background: {coef["color"]};'></div>
+                            </div>
+                            <div class='coef-grid'>
+                                <div class='coef-item'><span class='coef-icon'>🌡️</span> {coef["weather_text"]}</div>
+                                <div class='coef-item'><span class='coef-icon'>🌑</span> {coef["moon_text"]}</div>
+                                <div class='coef-item'><span class='coef-icon'>⚠️</span> {coef["reasons"]}</div>
+                            </div>
+                        </div>
+                        <div class='coef-val-box'>
+                            <div class='coef-val' style='color: {coef["color"]}'>{coef["score"]}</div>
+                            <div class='coef-level'>{coef["level"]}</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class='feed-link'><a href='{item.src}' target='_blank'>詳細を確認 &rarr;</a></div>
+            </div>
+        """)
+        html_buffer += card
+    
+    if not view_list: st.info("情報はありません")
+    else: st.markdown(html_buffer, unsafe_allow_html=True)
 
     st_autorefresh(interval=5 * 60 * 1000, key="refresh")
 
