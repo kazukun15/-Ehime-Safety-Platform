@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-愛媛セーフティ・プラットフォーム (ESP) - Psycho-Pass Edition
-Version: 15.0
+愛媛セーフティ・プラットフォーム (ESP) - Ultimate UI Edition
+Version: 16.0
 Author: World Class Program Designer
-Description: 全機能統合＋環境犯罪係数予測（月齢/気象/時刻ロジック搭載）
+Description: 犯罪係数の視覚化（メーター表示）、スタイリッシュUI、全機能統合版
 """
 
 import math
@@ -29,8 +29,8 @@ from streamlit_autorefresh import st_autorefresh
 # ==============================================================================
 class AppConfig:
     TITLE = "愛媛セーフティ・プラットフォーム"
-    SUBTITLE = "Criminal Coefficient Analysis v15.0"
-    USER_AGENT = "ESP/15.0-Psycho"
+    SUBTITLE = "Criminal Coefficient Visualizer v16.0"
+    USER_AGENT = "ESP/16.0-Visual"
     TIMEOUT = 10
     MAX_WORKERS = 4
     
@@ -55,7 +55,7 @@ class AppConfig:
         "宇和島市":(132.5600,33.2230),"八幡浜市":(132.4230,33.4620),
     }
 
-    # カテゴリ定義と基本リスク値
+    # 地図スタイル
     CAT_STYLE = {
         "交通事故": {"color": [230, 50, 50, 255],   "radius": 150, "icon": "💥", "base_risk": 40},
         "火災":     {"color": [255, 100, 0, 255],   "radius": 150, "icon": "🔥", "base_risk": 60},
@@ -84,19 +84,16 @@ class AppConfig:
 久米交差点,33.8143,132.7957,4,松山市久米"""
 
 # ==============================================================================
-# [Logic] 環境犯罪係数・予測ロジック (Psycho-Pass Logic)
+# [Logic] 環境犯罪係数・予測ロジック
 # ==============================================================================
-
 class EnvironmentalAnalyzer:
-    """気象・天文データに基づく環境分析クラス"""
+    """気象・天文データに基づく環境分析"""
     
     @staticmethod
     def get_moon_phase(date: datetime) -> Dict:
-        """日付から月齢を計算 (簡易法)"""
-        # 2000年1月6日が新月(月齢0)
+        """月齢計算"""
         diff = date - datetime(2000, 1, 6)
         days = diff.days
-        # 月の満ち欠け周期 約29.53日
         lunation = 29.53058867
         moon_age = days % lunation
         
@@ -104,131 +101,150 @@ class EnvironmentalAnalyzer:
         risk_factor = 1.0
         
         if moon_age < 1.0 or moon_age > 28.5:
-            phase_name = "新月🌑" # 暗闇による犯罪リスク増
+            phase_name = "新月🌑" # 暗闇リスク
             risk_factor = 1.15
         elif 13.8 < moon_age < 15.8:
-            phase_name = "満月🌕" # 衝動性リスク増(統計的アノマリー)
+            phase_name = "満月🌕" # 衝動性リスク
             risk_factor = 1.25
             
         return {"age": moon_age, "name": phase_name, "factor": risk_factor}
 
     @staticmethod
     def estimate_weather(lat: float, lon: float, dt: datetime) -> Dict:
-        """
-        APIキーなしで動作する、愛媛県の季節別高精度気象シミュレーター
-        (実際のAPIはキーが必要でエラー要因になるため、統計データから推計)
-        """
+        """愛媛県気象シミュレーション"""
         month = dt.month
         hour = dt.hour
-        
-        # 愛媛の平均的な気温カーブ (月別)
-        base_temps = {
-            1: 6, 2: 7, 3: 10, 4: 15, 5: 20, 6: 24,
-            7: 28, 8: 30, 9: 26, 10: 20, 11: 14, 12: 9
-        }
-        # 日内変動 (14時が最高、4時が最低)
+        base_temps = {1:6, 2:7, 3:10, 4:15, 5:20, 6:24, 7:28, 8:30, 9:26, 10:20, 11:14, 12:9}
         hour_offset = -math.cos(math.pi * (hour - 4) / 12) * 4
-        
-        temp = base_temps[month] + hour_offset
-        # ランダム揺らぎ (日々の変化)
-        temp += random.uniform(-2, 2)
-        
-        # 湿度推計 (夏は高く冬は低い)
+        temp = base_temps[month] + hour_offset + random.uniform(-2, 2)
         humidity = 60 + (20 if month in [6,7,8,9] else -10) + random.uniform(-5, 5)
-        
-        # 不快指数 (DI) = 0.81T + 0.01H(0.99T - 14.3) + 46.3
-        di = 0.81 * temp + 0.01 * humidity * (0.99 * temp - 14.3) + 46.3
+        di = 0.81 * temp + 0.01 * humidity * (0.99 * temp - 14.3) + 46.3 # 不快指数
         
         stress_factor = 1.0
-        if di > 75: stress_factor = 1.1 # やや暑い
-        if di > 80: stress_factor = 1.3 # 暑くて不快(イライラしやすい)
+        if di > 75: stress_factor = 1.1
+        if di > 80: stress_factor = 1.3
         
-        return {
-            "temp": round(temp, 1),
-            "humidity": round(humidity, 1),
-            "di": round(di, 1),
-            "factor": stress_factor
-        }
+        return {"temp": round(temp, 1), "humidity": round(humidity, 1), "di": round(di, 1), "factor": stress_factor}
 
 def calculate_crime_coefficient(category: str, dt: datetime) -> Dict:
-    """犯罪係数(Crime Coefficient)を算出する"""
+    """犯罪係数算出"""
     base = AppConfig.CAT_STYLE.get(category, AppConfig.CAT_STYLE["その他"])["base_risk"]
-    
-    # 環境要因
     moon = EnvironmentalAnalyzer.get_moon_phase(dt)
     weather = EnvironmentalAnalyzer.estimate_weather(33.8, 132.7, dt)
     
-    # 時間要因 (深夜はリスク増)
     time_factor = 1.0
-    if 23 <= dt.hour or dt.hour <= 4:
-        time_factor = 1.3
+    if 23 <= dt.hour or dt.hour <= 4: time_factor = 1.3
     
-    # 係数計算
     coef = base * moon["factor"] * weather["factor"] * time_factor
-    
-    # 上限キャップ
     coef = min(99.9, max(10.0, coef))
     
-    # 分析コメント生成
     reasons = []
-    if moon["factor"] > 1.1: reasons.append(f"{moon['name']}傾向")
-    if weather["di"] > 80: reasons.append("高不快指数")
+    if moon["factor"] > 1.1: reasons.append(moon['name'])
+    if weather["di"] > 80: reasons.append("不快指数高")
     if time_factor > 1.1: reasons.append("深夜帯")
-    if not reasons: reasons.append("通常レベル")
+    if not reasons: reasons.append("平常")
     
-    # 色判定
-    color = "#2ecc71" # 安全(緑)
-    if coef > 60: color = "#f1c40f" # 注意(黄)
-    if coef > 80: color = "#e74c3c" # 危険(赤)
+    # カラーコード定義
+    color = "#2ecc71" # Safe (Green)
+    level = "Normal"
+    if coef > 60: 
+        color = "#f39c12" # Caution (Orange)
+        level = "Caution"
+    if coef > 80: 
+        color = "#e74c3c" # Danger (Red)
+        level = "Critical"
     
     return {
         "score": int(coef),
         "color": color,
-        "reasons": " / ".join(reasons),
+        "level": level,
+        "reasons": "・".join(reasons),
         "weather_text": f"{weather['temp']}℃ (不快指数{int(weather['di'])})",
         "moon_text": moon["name"]
     }
 
 # ==============================================================================
-# [UI/CSS] デザイン
+# [UI/CSS] スタイリッシュデザイン
 # ==============================================================================
 def inject_css():
     st.markdown("""
     <style>
-      :root{ --bg: #f4f7f9; --card: #ffffff; --text: #333333; --muted: #666666; --accent: #0066cc; --border: #e0e0e0; }
-      .stApp { background-color: var(--bg); color: var(--text); }
+      :root{ --bg: #f4f7f9; --card: #ffffff; --text: #333; --muted: #666; --accent: #0984e3; --border: #dfe6e9; }
+      .stApp { background-color: var(--bg); color: var(--text); font-family: 'Helvetica Neue', Arial, sans-serif; }
       a { color: var(--accent) !important; text-decoration: none; }
       
       /* タブ */
-      .stTabs [data-baseweb="tab-list"] { gap: 8px; margin-bottom: 12px; }
-      .stTabs [data-baseweb="tab"] { height: 48px; flex: 1; background-color: #eaeff3; border-radius: 8px; color: var(--muted); font-weight: 600; border: 1px solid transparent; }
-      .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: var(--accent); color: white; border-color: var(--accent); }
+      .stTabs [data-baseweb="tab-list"] { gap: 8px; margin-bottom: 16px; }
+      .stTabs [data-baseweb="tab"] { height: 50px; flex: 1; background-color: #dfe6e9; border-radius: 8px; color: var(--muted); font-weight: 700; border: none; }
+      .stTabs [data-baseweb="tab"][aria-selected="true"] { background-color: var(--accent); color: white; box-shadow: 0 4px 6px rgba(9, 132, 227, 0.3); }
+
+      /* カード */
+      .feed-card {
+        background: var(--card); padding: 0; border-radius: 12px; border: 1px solid var(--border);
+        margin-bottom: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); overflow: hidden;
+      }
+      .feed-content { padding: 16px; }
+      
+      .feed-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+      .feed-title { font-weight: 800; font-size: 1.05rem; display:flex; align-items:center; gap:6px; color: #2d3436; }
+      .feed-loc { font-size: 0.75rem; background: #f1f2f6; padding: 4px 10px; border-radius: 20px; color: #636e72; font-weight: 600; letter-spacing: 0.5px;}
+      .feed-body { font-size: 0.95rem; line-height: 1.6; color: #636e72; margin-bottom: 12px; }
+
+      /* --- スタイリッシュ犯罪係数パネル --- */
+      .coef-panel {
+        background: #f8f9fa; padding: 12px 16px; border-top: 1px solid var(--border);
+        display: flex; flex-direction: column; gap: 8px;
+      }
+      .coef-row-main {
+        display: flex; justify-content: space-between; align-items: flex-end;
+      }
+      .coef-label {
+        font-size: 0.7rem; font-weight: 700; color: #b2bec3; letter-spacing: 1px; margin-bottom: 2px;
+      }
+      .coef-val-box {
+        text-align: right; line-height: 1;
+      }
+      .coef-val {
+        font-family: 'Courier New', monospace; font-weight: 900; font-size: 2.2rem;
+        letter-spacing: -1px; text-shadow: 0 2px 4px rgba(0,0,0,0.1);
+      }
+      .coef-level {
+        font-size: 0.7rem; font-weight: 800; text-transform: uppercase; color: #b2bec3;
+      }
+
+      /* メーターバー */
+      .meter-track {
+        width: 100%; height: 6px; background: #dfe6e9; border-radius: 3px; overflow: hidden; margin-top: 4px;
+      }
+      .meter-fill {
+        height: 100%; border-radius: 3px; transition: width 0.5s ease-out;
+      }
+
+      /* 詳細グリッド */
+      .coef-grid {
+        display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 6px;
+      }
+      .coef-item {
+        background: #fff; padding: 6px 10px; border-radius: 6px; border: 1px solid #eee;
+        font-size: 0.8rem; display: flex; align-items: center; gap: 6px; color: #636e72; font-weight: 500;
+      }
+      .coef-icon { font-size: 1rem; }
+
+      .feed-link { text-align: right; padding: 8px 16px; background: #fff; border-top: 1px solid #f1f2f6;}
+      .feed-link a { font-size: 0.85rem; font-weight: 700; color: var(--accent); }
 
       /* ティッカー */
-      .ticker-wrap { width: 100%; overflow: hidden; background: var(--card); border-y: 1px solid var(--border); white-space: nowrap; padding: 10px 0; margin-bottom: 12px; }
+      .ticker-wrap { background: #fff; border-bottom: 1px solid var(--border); border-top: 1px solid var(--border); padding: 8px 0; white-space: nowrap; overflow: hidden; margin-bottom: 10px;}
       .ticker { display: inline-block; animation: ticker 50s linear infinite; }
       @keyframes ticker { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
-      .ticker-item { margin-right: 40px; color: var(--text); font-size: 0.9rem; display: inline-flex; align-items: center; }
-      .ticker-tag { background: #eaeff3; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; margin-right: 6px; color: var(--muted); font-weight: bold;}
-
-      /* カード (係数表示付き) */
-      .feed-card { background: var(--card); padding: 16px; border-radius: 12px; border: 1px solid var(--border); margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
-      .feed-header { display: flex; justify-content: space-between; margin-bottom: 8px; align-items: center;}
-      .feed-title { font-weight: 700; color: var(--text); display:flex; align-items:center; gap:8px; font-size: 1rem;}
-      .feed-loc { font-size: 0.8rem; background: #eaeff3; padding: 4px 10px; border-radius: 12px; color: var(--muted); font-weight: 600;}
-      .feed-body { font-size: 0.95rem; line-height: 1.6; color: #444; margin-bottom: 8px; }
+      .ticker-item { margin-right: 32px; color: #2d3436; font-size: 0.85rem; font-weight: 500; display: inline-flex; align-items: center; }
       
-      /* 犯罪係数バッジ */
-      .coef-badge { display: flex; align-items: center; justify-content: space-between; background: #f8f9fa; padding: 8px 12px; border-radius: 8px; border-left: 4px solid #ccc; margin-top:8px;}
-      .coef-val { font-size: 1.2rem; font-weight: 900; font-family: 'Courier New', monospace; }
-      .coef-meta { font-size: 0.8rem; color: #666; text-align: right; line-height: 1.2;}
-
-      .map-tooltip { background: white !important; color: #333 !important; border: 1px solid #eee !important; box-shadow: 0 2px 8px rgba(0,0,0,0.15) !important;}
+      .map-tooltip { background: rgba(255,255,255,0.95) !important; color: #2d3436 !important; box-shadow: 0 4px 12px rgba(0,0,0,0.15) !important; border-radius: 8px !important; border:none !important;}
     </style>
     """, unsafe_allow_html=True)
 
 # ==============================================================================
-# [Geometry] 渋滞線生成ロジック (JARTIC Line Snapping)
+# [Geometry] 渋滞線生成ロジック
 # ==============================================================================
 def _meters_scale(lat: float) -> Tuple[float, float]:
     return 111320 * math.cos(math.radians(lat)), 110540
@@ -274,8 +290,7 @@ def build_snap_lines(jpoints: List[Dict], ways: List[Dict]) -> List[Dict]:
 @dataclass
 class Incident:
     category: str; summary: str; municipality: str; lon: float; lat: float; 
-    style: Dict; src: str; 
-    coef: Dict # 犯罪係数データ
+    style: Dict; src: str; coef: Dict
 
 def fetch_police_data(days: int = 7) -> List[Incident]:
     try:
@@ -300,10 +315,7 @@ def parse_incident(head: str, body: str) -> Incident:
     muni = next((k for k in AppConfig.CITY_DATA if k in full), "愛媛県")
     lon, lat = AppConfig.CITY_DATA.get(muni, (AppConfig.EHIME_LON, AppConfig.EHIME_LAT))
     lon += random.uniform(-0.015, 0.015); lat += random.uniform(-0.015, 0.015)
-    
-    # ★犯罪係数算出
     coef_data = calculate_crime_coefficient(cat, datetime.now())
-    
     return Incident(cat, body[:90]+"..." if len(body)>90 else body, muni, lon, lat, 
                     AppConfig.CAT_STYLE.get(cat, AppConfig.CAT_STYLE["その他"]), 
                     AppConfig.POLICE_URL, coef_data)
@@ -344,19 +356,18 @@ def main():
     inject_css()
 
     with st.sidebar:
-        st.header("⚙️ 設定・環境")
-        # 環境情報の表示
+        st.header("⚙️ 設定")
         env = EnvironmentalAnalyzer.estimate_weather(33.8, 132.7, datetime.now())
         moon = EnvironmentalAnalyzer.get_moon_phase(datetime.now())
-        st.info(f"🌡️ 気温: {env['temp']}℃\n💧 湿度: {env['humidity']}%\n🌕 月齢: {moon['name']}\n(シミュレーション値)")
+        st.caption(f"ENV: {env['temp']}℃ / {moon['name']}")
         
-        area_filter = st.multiselect("地域", list(AppConfig.CITY_DATA.keys()))
-        map_style = st.selectbox("地図背景", list(AppConfig.TILESETS.keys()))
+        area_filter = st.multiselect("地域フィルタ", list(AppConfig.CITY_DATA.keys()))
+        map_style = st.selectbox("地図スタイル", list(AppConfig.TILESETS.keys()))
         is_3d = st.toggle("3Dモード", value=True)
-        show_jartic = st.toggle("JARTIC交通情報", value=True)
+        show_jartic = st.toggle("交通情報", value=True)
         show_hotspots = st.toggle("危険交差点", value=True)
 
-    with st.spinner("犯罪係数を解析中..."):
+    with st.spinner("Analyzing..."):
         with ThreadPoolExecutor(max_workers=AppConfig.MAX_WORKERS) as exe:
             f1 = exe.submit(fetch_police_data)
             f2 = exe.submit(fetch_jartic_data)
@@ -369,14 +380,13 @@ def main():
 
     # Ticker
     ticker_html = ""
-    for i in incidents[:7]:
-        ticker_html += f"<span class='ticker-item'><span class='ticker-tag'>{i.category}</span>{i.municipality}｜犯罪係数:{i.coef['score']}</span>"
-    if show_jartic: ticker_html += "<span class='ticker-item' style='color:#0066cc; font-weight:bold;'>【交通】リアルタイム連携中</span>"
+    for i in incidents[:5]:
+        ticker_html += f"<span class='ticker-item'><b>{i.category}</b> {i.municipality} ({i.coef['score']})</span>"
+    if show_jartic: ticker_html += "<span class='ticker-item' style='color:#0984e3'><b>JARTIC</b> リアルタイム交通情報</span>"
     st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{ticker_html}</div></div>", unsafe_allow_html=True)
 
     tab_map, tab_list = st.tabs(["🗺️ マップ", "🚨 解析リスト"])
 
-    # === TAB 1: MAP ===
     with tab_map:
         layers = []
         tile = AppConfig.TILESETS[map_style]
@@ -398,18 +408,17 @@ def main():
             df_inc["color"] = df_inc["style"].apply(lambda s: s["color"])
             df_inc["radius"] = df_inc["style"].apply(lambda s: s["radius"])
             df_inc["icon"] = df_inc["style"].apply(lambda s: s["icon"])
-            # Tooltipに係数を追加
             df_inc["tooltip"] = df_inc.apply(lambda r: f"""
                 <div style='font-family:sans-serif; padding:4px;'>
-                <b>{r['icon']} {r['category']}</b> (係数:{r['coef']['score']})<br>
-                {r['municipality']}<br>{r['summary'][:30]}
+                <div style='font-size:1.1em;font-weight:bold;margin-bottom:4px'>{r['icon']} {r['category']} <span style='font-size:0.8em;color:{r['coef']['color']}'>Lv.{r['coef']['score']}</span></div>
+                <div style='font-size:0.9em;color:#555'>{r['municipality']}</div>
+                <div style='margin-top:4px'>{r['summary'][:30]}</div>
                 </div>""".replace("\n", ""), axis=1)
             layers.append(pdk.Layer("ScatterplotLayer", data=df_inc, get_position="[lon, lat]", get_fill_color="color", get_radius="radius", stroked=True, get_line_color=[255,255,255], line_width_min_pixels=2, pickable=True))
 
         view_state = pdk.ViewState(latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON, zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0)
         st.pydeck_chart(pdk.Deck(layers=layers, initial_view_state=view_state, tooltip={"html": "{tooltip}", "style": {"color": "#333", "backgroundColor": "white"}}, map_provider=None, map_style=None), use_container_width=True, height=520)
 
-    # === TAB 2: LIST ===
     with tab_list:
         st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
         q = st.text_input("検索", placeholder="キーワード...")
@@ -417,29 +426,42 @@ def main():
         
         html_buffer = ""
         for item in view_list:
-            # 係数による色分けスタイル
             coef = item.coef
             card = textwrap.dedent(f"""
                 <div class='feed-card'>
-                    <div class='feed-header'>
-                        <div class='feed-title'><span>{item.style['icon']}</span>{item.category}</div>
-                        <div class='feed-loc'>{item.municipality}</div>
-                    </div>
-                    <div class='feed-body'>{item.summary}</div>
-                    <div class='coef-badge' style='border-left-color: {coef["color"]}'>
-                        <div>
-                            <div style='font-size:0.75rem; color:#888;'>CRIMINAL COEFFICIENT</div>
-                            <div class='coef-val' style='color: {coef["color"]}'>{coef["score"]}</div>
+                    <div class='feed-content'>
+                        <div class='feed-header'>
+                            <div class='feed-title'><span>{item.style['icon']}</span>{item.category}</div>
+                            <div class='feed-loc'>{item.municipality}</div>
                         </div>
-                        <div class='coef-meta'>
-                            要因: {coef["reasons"]}<br>
-                            環境: {coef["weather_text"]} / {coef["moon_text"]}
+                        <div class='feed-body'>{item.summary}</div>
+                    </div>
+                    
+                    <div class='coef-panel'>
+                        <div class='coef-label'>CRIME COEFFICIENT</div>
+                        <div class='coef-row-main'>
+                            <div style='width:100%; margin-right:12px;'>
+                                <div class='meter-track'>
+                                    <div class='meter-fill' style='width: {coef["score"]}%; background: {coef["color"]};'></div>
+                                </div>
+                                <div class='coef-grid'>
+                                    <div class='coef-item'><span class='coef-icon'>🌡️</span> {coef["weather_text"]}</div>
+                                    <div class='coef-item'><span class='coef-icon'>🌑</span> {coef["moon_text"]}</div>
+                                    <div class='coef-item'><span class='coef-icon'>⚠️</span> {coef["reasons"]}</div>
+                                </div>
+                            </div>
+                            <div class='coef-val-box'>
+                                <div class='coef-val' style='color: {coef["color"]}'>{coef["score"]}</div>
+                                <div class='coef-level'>{coef["level"]}</div>
+                            </div>
                         </div>
                     </div>
+                    
                     <div class='feed-link'><a href='{item.src}' target='_blank'>詳細を確認 &rarr;</a></div>
                 </div>
             """)
             html_buffer += card
+        
         if not view_list: st.info("情報はありません")
         else: st.markdown(html_buffer, unsafe_allow_html=True)
 
