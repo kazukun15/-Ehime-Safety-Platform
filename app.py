@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-愛媛セーフティ・プラットフォーム (ESP) - HTML Rendering Fix Edition
-Version: 19.0
+愛媛セーフティ・プラットフォーム (ESP) - Map Provider Fix Edition
+Version: 20.0
 Author: World Class Program Designer
-Description: HTML描画バグ修正（Minify処理追加）、地図表示安定化、スマホ最適化完全版
+Description: 地図表示不具合の完全修正（CORS対応プロバイダへの変更）、全機能統合版
 """
 
 import math
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 class AppConfig:
     TITLE = "愛媛セーフティ・プラットフォーム"
-    SUBTITLE = "Safety Dashboard v19.0"
-    USER_AGENT = "ESP/19.0-Fix"
+    SUBTITLE = "Safety Dashboard v20.0"
+    USER_AGENT = "ESP/20.0-MapFix"
     TIMEOUT = 5
     MAX_WORKERS = 4
     
@@ -69,12 +69,32 @@ class AppConfig:
         "その他":   {"color": [100, 100, 100, 200], "radius": 100, "icon": "・", "base_risk": 20},
     }
 
-    # タイルセット（APIキー不要なものを厳選）
+    # ★重要修正★ CORS対応の高品質な地図プロバイダに変更
+    # これにより「地図が真っ黒になる」問題を解決
     TILESETS = {
-        "標準 (OSM)": {"url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png", "max_zoom": 19},
-        "Googleマップ (道路)": {"url": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}", "max_zoom": 20},
-        "Googleマップ (航空写真)": {"url": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}", "max_zoom": 20},
-        "淡色地図": {"url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", "max_zoom": 18},
+        "標準 (OSM)": {
+            "url": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "max_zoom": 19
+        },
+        "シンプル (CartoDB)": {
+            # Googleマップ道路地図の代替。非常に高速で美しい。
+            "url": "https://basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png",
+            "max_zoom": 19
+        },
+        "ダーク (CartoDB)": {
+            # 夜間モード風。データが目立つ。
+            "url": "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+            "max_zoom": 19
+        },
+        "航空写真 (Esri)": {
+            # Googleアースの代替。CORS対応で確実に表示される衛星写真。
+            "url": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+            "max_zoom": 18
+        },
+        "淡色地図 (地理院)": {
+            "url": "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png",
+            "max_zoom": 18
+        },
     }
 
     HOTSPOT_CSV = """地点名,緯度,経度,年間最多事故件数,補足
@@ -88,16 +108,11 @@ class AppConfig:
 久米交差点,33.8143,132.7957,4,松山市久米"""
 
 # ==============================================================================
-# [Helper] HTML整形関数 (ここが修正の肝です)
+# [Helper] HTML整形関数
 # ==============================================================================
 def clean_html(html_str: str) -> str:
-    """
-    HTML文字列から改行と余分な空白を除去し、1行にします。
-    これにより、Markdownがインデントをコードブロックとして誤認識するのを防ぎます。
-    """
-    # 改行をスペースに置換
+    """HTML文字列から改行と余分な空白を除去し、コードブロック化を防ぐ"""
     s = html_str.replace("\n", " ")
-    # 連続するスペースを1つに置換
     s = re.sub(r'\s+', ' ', s)
     return s.strip()
 
@@ -111,14 +126,12 @@ def inject_css():
       .stApp { background-color: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
       a { color: var(--accent) !important; text-decoration: none; }
       
-      /* セクションヘッダー */
       .section-header {
         font-size: 1.1rem; font-weight: 700; color: var(--text); margin: 20px 0 10px 0;
         display: flex; align-items: center; gap: 8px;
         border-left: 4px solid var(--accent); padding-left: 12px; background: #fff; padding-top:8px; padding-bottom:8px; border-radius: 0 4px 4px 0;
       }
 
-      /* カード全体 */
       .feed-card {
         background: var(--card); padding: 0; border-radius: 8px; border: 1px solid var(--border);
         margin-bottom: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.02); overflow: hidden;
@@ -130,10 +143,7 @@ def inject_css():
       .feed-loc { font-size: 0.75rem; background: #e9ecef; padding: 2px 8px; border-radius: 4px; color: var(--muted); font-weight: 600; white-space: nowrap;}
       .feed-body { font-size: 0.9rem; line-height: 1.5; color: #495057; margin-bottom: 12px; }
 
-      /* 犯罪係数パネル */
-      .coef-panel {
-        background: #f8f9fa; padding: 12px 16px; border-top: 1px solid var(--border);
-      }
+      .coef-panel { background: #f8f9fa; padding: 12px 16px; border-top: 1px solid var(--border); }
       .coef-label { font-size: 0.65rem; font-weight: 700; color: #adb5bd; letter-spacing: 0.5px; margin-bottom: 4px; }
       .coef-row-main { display: flex; justify-content: space-between; align-items: center; gap: 12px;}
       
@@ -152,7 +162,6 @@ def inject_css():
 
       .feed-link { text-align: right; padding: 8px 16px; background: #fff; border-top: 1px solid #f1f2f6;}
       
-      /* ティッカー */
       .ticker-wrap { background: #fff; border-bottom: 1px solid var(--border); padding: 8px 0; white-space: nowrap; overflow: hidden; margin-bottom: 10px;}
       .ticker { display: inline-block; animation: ticker 60s linear infinite; }
       @keyframes ticker { 0% { transform: translateX(100%); } 100% { transform: translateX(-100%); } }
@@ -172,12 +181,9 @@ class EnvironmentalAnalyzer:
         days = diff.days
         lunation = 29.53058867
         moon_age = days % lunation
-        phase_name = "通常月"
-        risk_factor = 1.0
-        if moon_age < 1.0 or moon_age > 28.5:
-            phase_name = "新月🌑"; risk_factor = 1.15
-        elif 13.8 < moon_age < 15.8:
-            phase_name = "満月🌕"; risk_factor = 1.25
+        phase_name = "通常月"; risk_factor = 1.0
+        if moon_age < 1.0 or moon_age > 28.5: phase_name = "新月🌑"; risk_factor = 1.15
+        elif 13.8 < moon_age < 15.8: phase_name = "満月🌕"; risk_factor = 1.25
         return {"age": moon_age, "name": phase_name, "factor": risk_factor}
 
     @staticmethod
@@ -198,7 +204,6 @@ def calculate_crime_coefficient(category: str, dt: datetime) -> Dict:
     moon = EnvironmentalAnalyzer.get_moon_phase(dt)
     weather = EnvironmentalAnalyzer.estimate_weather(33.8, 132.7, dt)
     time_factor = 1.3 if (23 <= dt.hour or dt.hour <= 4) else 1.0
-    
     coef = base * moon["factor"] * weather["factor"] * time_factor
     coef = min(99.9, max(10.0, coef))
     
@@ -208,10 +213,9 @@ def calculate_crime_coefficient(category: str, dt: datetime) -> Dict:
     if time_factor > 1.1: reasons.append("深夜帯")
     if not reasons: reasons.append("平常")
     
-    color = "#198754" # Normal (Green)
-    level = "NORMAL"
-    if coef > 60: color = "#ffc107"; level = "CAUTION" # Yellow
-    if coef > 80: color = "#dc3545"; level = "CRITICAL" # Red
+    color = "#198754"; level = "NORMAL"
+    if coef > 60: color = "#ffc107"; level = "CAUTION"
+    if coef > 80: color = "#dc3545"; level = "CRITICAL"
     
     return {
         "score": int(coef), "color": color, "level": level, "reasons": " ".join(reasons),
@@ -379,14 +383,12 @@ def main():
     for i in incidents[:5]:
         ticker_html += f"<span class='ticker-item'><b>{i.category}</b> {i.municipality} ({i.coef['score']})</span>"
     if show_jartic: ticker_html += "<span class='ticker-item' style='color:#0984e3'><b>JARTIC</b> 交通情報連携中</span>"
-    # ここでclean_htmlを使用
     st.markdown(f"<div class='ticker-wrap'><div class='ticker'>{clean_html(ticker_html)}</div></div>", unsafe_allow_html=True)
 
     # === MAP SECTION ===
     st.markdown("<div class='section-header'>🗺️ リアルタイム・セーフティマップ</div>", unsafe_allow_html=True)
     
     layers = []
-    # ★重要: TileLayerを確実に表示させるための設定
     tile = AppConfig.TILESETS[map_style]
     layers.append(pdk.Layer("TileLayer", data=tile["url"], min_zoom=0, max_zoom=tile["max_zoom"], opacity=1.0))
 
@@ -407,7 +409,7 @@ def main():
         df_inc["radius"] = df_inc["style"].apply(lambda s: s["radius"])
         df_inc["icon"] = df_inc["style"].apply(lambda s: s["icon"])
         
-        # ツールチップHTMLも整形
+        # ツールチップのHTMLもclean_htmlで整形
         df_inc["tooltip"] = df_inc.apply(lambda r: clean_html(f"""
             <div style='font-family:sans-serif; padding:4px;'>
             <div style='font-size:1rem;font-weight:bold;margin-bottom:4px'>{r['icon']} {r['category']} <span style='font-size:0.8em;color:{r['coef']['color']}'>Lv.{r['coef']['score']}</span></div>
@@ -418,7 +420,6 @@ def main():
 
     view_state = pdk.ViewState(latitude=AppConfig.EHIME_LAT, longitude=AppConfig.EHIME_LON, zoom=AppConfig.INIT_ZOOM, pitch=45 if is_3d else 0)
     
-    # ★重要: map_provider=None と map_style=None を指定してAPIキー不要化
     st.pydeck_chart(pdk.Deck(
         layers=layers, 
         initial_view_state=view_state, 
@@ -427,7 +428,7 @@ def main():
         map_style=None
     ), use_container_width=True, height=500)
 
-    # === LIST SECTION (Vertical Layout) ===
+    # === LIST SECTION ===
     st.markdown("<div class='section-header'>🚨 発生事案ニュース & 犯罪係数</div>", unsafe_allow_html=True)
     
     q = st.text_input("検索", placeholder="キーワード (例: 事故, 松山市...)")
@@ -436,7 +437,7 @@ def main():
     html_buffer = ""
     for item in view_list:
         coef = item.coef
-        # HTMLのインデントを気にせず書く（clean_htmlで後処理するため）
+        # HTMLを記述し、clean_html()で1行に圧縮する
         card_html = f"""
             <div class='feed-card'>
                 <div class='feed-content'>
@@ -446,7 +447,6 @@ def main():
                     </div>
                     <div class='feed-body'>{item.summary}</div>
                 </div>
-                
                 <div class='coef-panel'>
                     <div class='coef-label'>CRIME COEFFICIENT</div>
                     <div class='coef-row-main'>
@@ -466,11 +466,9 @@ def main():
                         </div>
                     </div>
                 </div>
-                
                 <div class='feed-link'><a href='{item.src}' target='_blank'>詳細を確認 &rarr;</a></div>
             </div>
         """
-        # ★ここでHTMLを整形・圧縮
         html_buffer += clean_html(card_html)
     
     if not view_list: st.info("情報はありません")
